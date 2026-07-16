@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.log
+training_log.csv
+data/
+*/data/
+*.zip
+.venv/
+venv/
+.env
