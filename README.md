@@ -7,9 +7,9 @@ Three aiarena.net StarCraft II ladder bots sharing one adaptive architecture:
 
 | Bot | Race | Builds |
 |---|---|---|
-| **Battencruiser** | Terran | 3-rax stim timing / bio+medivac+tank macro / proxy 2-rax |
-| **Zacling** | Zerg | roach timing / 3-base roach-hydra / 12-pool speedlings |
-| **Protodd** | Protoss | 4-gate warp rush / stalker-immortal macro / proxy gates |
+| **Battencruiser** | Terran | learned bio, mech, air, mixed, and proxy plans |
+| **Zacling** | Zerg | learned swarm, ranged, air, hive, and rush plans |
+| **Protodd** | Protoss | learned gateway, robotics, fleet, mixed, and proxy plans |
 
 Every bot has per-opponent persistent learning (build bandit, attack-timing
 bandit, threat fingerprinting with pre-adaptation), fight-or-flee combat
@@ -18,7 +18,7 @@ spreading. See each bot folder's README/source for details.
 
 ## What the bots learn (v5 - generative openings)
 
-Four independent dimensions are learned per opponent (~135 combinations),
+Independent dimensions are learned per opponent (thousands of combinations),
 each scored 65% vs that opponent / 35% globally, with exploration noise so
 the bots keep experimenting instead of locking into one build:
 
@@ -28,6 +28,8 @@ the bots keep experimenting instead of locking into one build:
 * **aggression** - attack at 0.55x to 1.7x the normal army size
 * **greed** - worker counts and expansion timing (lean / standard / greedy)
 * **tech** - composition focus (e.g. marauder_bio, ling_flood, chargelot)
+* **army plan** - full race tech-tree exploration: bio/mech/sky, gateway/robo/fleet,
+  and swarm/ranged/air/hive compositions, including specialist and capital units
 
 They also adapt in-game (repelled attacks raise the next attack's size bar,
 unit mix follows the enemy's armored/light/air ratios) and fingerprint
@@ -46,6 +48,10 @@ attack timings get tuned, and scouted threats get pre-countered next game.
     py -3 train.py --hours 8        (or double-click train.bat)
     py -3 train.py --games 30       quick session
     py -3 train.py --map AutomatonLE --hours 2
+
+Matches allow up to three in-game hours (`10800` game seconds). Because games
+run faster than real time, the arena uses a 90-minute real-time safety timeout
+for a stuck match while the overall `--hours` setting remains wall-clock time.
 
 Requirements: StarCraft II installed, `pip install burnysc2`, and ladder maps
 from https://aiarena.net/wiki/maps/ in your StarCraft II\Maps folder.

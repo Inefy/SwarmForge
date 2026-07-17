@@ -33,10 +33,18 @@ from sc2.position import Point2
 from bot.strategy import StrategyManager
 
 DEPOT_TYPES = {UnitTypeId.SUPPLYDEPOT, UnitTypeId.SUPPLYDEPOTLOWERED, UnitTypeId.SUPPLYDEPOTDROP}
-BIO_TYPES = {UnitTypeId.MARINE, UnitTypeId.MARAUDER}
+BIO_TYPES = {UnitTypeId.MARINE, UnitTypeId.MARAUDER, UnitTypeId.REAPER, UnitTypeId.GHOST}
 TANK_TYPES = {UnitTypeId.SIEGETANK, UnitTypeId.SIEGETANKSIEGED}
 VIKING_TYPES = {UnitTypeId.VIKINGFIGHTER, UnitTypeId.VIKINGASSAULT}
-ARMY_TYPES = BIO_TYPES | TANK_TYPES | VIKING_TYPES | {UnitTypeId.MEDIVAC}
+MECH_TYPES = TANK_TYPES | {
+    UnitTypeId.HELLION, UnitTypeId.HELLIONTANK, UnitTypeId.WIDOWMINE,
+    UnitTypeId.WIDOWMINEBURROWED, UnitTypeId.CYCLONE, UnitTypeId.THOR,
+}
+AIR_TYPES = VIKING_TYPES | {
+    UnitTypeId.MEDIVAC, UnitTypeId.LIBERATOR, UnitTypeId.LIBERATORAG,
+    UnitTypeId.RAVEN, UnitTypeId.BANSHEE, UnitTypeId.BATTLECRUISER,
+}
+ARMY_TYPES = BIO_TYPES | MECH_TYPES | AIR_TYPES
 WORKER_TYPES = {UnitTypeId.SCV, UnitTypeId.PROBE, UnitTypeId.DRONE, UnitTypeId.MULE}
 IGNORE_TARGETS = {UnitTypeId.LARVA, UnitTypeId.EGG, UnitTypeId.BROODLING, UnitTypeId.INTERCEPTOR}
 SCOUT_IGNORE = {UnitTypeId.OVERLORD, UnitTypeId.OVERSEER, UnitTypeId.OBSERVER}
@@ -240,6 +248,34 @@ class BattencruiserBot(BotAI):
                 elif tech == "marauder_bio":
                     cfg["techlab_cap"] = max(cfg["techlab_cap"], 2)
                     cfg["marauder"] = True
+                army = getattr(self.strategy, "army", "mixed")
+                if army == "bio":
+                    cfg["rax_cap"] += 2
+                    cfg["want_ghost_academy"] = self.time > 420
+                elif army == "mech":
+                    cfg["factory_cap"] = 3
+                    cfg["starport_cap"] = max(1, cfg["starport_cap"])
+                    cfg["want_factory"] = self.time > 170
+                    cfg["want_armory"] = self.time > 300
+                    cfg["tank_cap"] = 10
+                    cfg["gas_target"] = max(cfg["gas_target"], 5)
+                elif army == "sky":
+                    cfg["starport_cap"] = 3
+                    cfg["factory_cap"] = max(1, cfg["factory_cap"])
+                    cfg["want_factory"] = self.time > 170
+                    cfg["want_starport"] = self.time > 220
+                    cfg["want_fusion"] = self.time > 480
+                    cfg["gas_target"] = max(cfg["gas_target"], 6)
+                    cfg["medivac_cap"] = 2
+                else:
+                    cfg["factory_cap"] = max(2, cfg["factory_cap"])
+                    cfg["starport_cap"] = max(2, cfg["starport_cap"])
+                    cfg["want_factory"] = self.time > 190
+                    cfg["want_starport"] = self.time > 240
+                    cfg["want_armory"] = self.time > 360
+                    cfg["want_ghost_academy"] = self.time > 500
+                    cfg["want_fusion"] = self.time > 600
+                    cfg["gas_target"] = max(cfg["gas_target"], 5)
         except Exception:
             pass
         return cfg
@@ -256,6 +292,8 @@ class BattencruiserBot(BotAI):
                 want_starport=False, want_ebay=False, want_turrets=False,
                 techlab_cap=0, attack_min_bio=4, retreat_bio=0,
                 medivac_cap=0, tank_cap=0, marauder=False, want_bunker=False,
+                factory_cap=0, starport_cap=0, want_armory=False,
+                want_ghost_academy=False, want_fusion=False,
             )
         developed = bases >= 2 or t > 330
         if not developed:
@@ -281,6 +319,11 @@ class BattencruiserBot(BotAI):
             tank_cap=(2 if bases >= 2 else 0),
             marauder=True,
             want_bunker=self.enemy_rush_detected,
+            factory_cap=(1 if developed else 0),
+            starport_cap=(1 if developed else 0),
+            want_armory=(developed and t > 420),
+            want_ghost_academy=False,
+            want_fusion=False,
         )
 
     # ------------------------------------------------------------------ frame
@@ -678,7 +721,7 @@ class BattencruiserBot(BotAI):
                 self.structures.of_type({UnitTypeId.FACTORY, UnitTypeId.FACTORYFLYING}).amount
                 + self.already_pending(UnitTypeId.FACTORY)
             )
-            if fact_total < 1 and self.can_afford(UnitTypeId.FACTORY):
+            if fact_total < cfg["factory_cap"] and self.can_afford(UnitTypeId.FACTORY):
                 near = self.start_location.towards(self.game_info.map_center, 12)
                 await self._build_at(UnitTypeId.FACTORY, near, step=7)
 
@@ -688,7 +731,7 @@ class BattencruiserBot(BotAI):
                 self.structures.of_type({UnitTypeId.STARPORT, UnitTypeId.STARPORTFLYING}).amount
                 + self.already_pending(UnitTypeId.STARPORT)
             )
-            if port_total < 1 and self.can_afford(UnitTypeId.STARPORT):
+            if port_total < cfg["starport_cap"] and self.can_afford(UnitTypeId.STARPORT):
                 near = self.start_location.towards(self.game_info.map_center, 12)
                 await self._build_at(UnitTypeId.STARPORT, near, step=7)
 
@@ -702,14 +745,24 @@ class BattencruiserBot(BotAI):
                 near = self.townhalls.first.position.towards(self.game_info.map_center, 6)
                 await self._build_at(UnitTypeId.ENGINEERINGBAY, near, step=4)
 
-        # Armory (enables +2/+3 infantry upgrades)
-        if self.already_pending_upgrade(UpgradeId.TERRANINFANTRYWEAPONSLEVEL1) > 0.4:
+        # Armory unlocks heavy mech and later upgrades.
+        if cfg["want_armory"] or self.already_pending_upgrade(UpgradeId.TERRANINFANTRYWEAPONSLEVEL1) > 0.4:
             armory_total = (
                 self.structures(UnitTypeId.ARMORY).amount + self.already_pending(UnitTypeId.ARMORY)
             )
             if armory_total < 1 and self.can_afford(UnitTypeId.ARMORY):
                 near = self.start_location.towards(self.game_info.map_center, 10)
                 await self._build_at(UnitTypeId.ARMORY, near, step=4)
+
+        if cfg["want_ghost_academy"] and self.structures(UnitTypeId.BARRACKS).ready:
+            total = self.structures(UnitTypeId.GHOSTACADEMY).amount + self.already_pending(UnitTypeId.GHOSTACADEMY)
+            if total == 0 and self.can_afford(UnitTypeId.GHOSTACADEMY):
+                await self._build_at(UnitTypeId.GHOSTACADEMY, self.start_location, step=4)
+
+        if cfg["want_fusion"] and self.structures(UnitTypeId.STARPORT).ready:
+            total = self.structures(UnitTypeId.FUSIONCORE).amount + self.already_pending(UnitTypeId.FUSIONCORE)
+            if total == 0 and self.can_afford(UnitTypeId.FUSIONCORE):
+                await self._build_at(UnitTypeId.FUSIONCORE, self.start_location, step=4)
 
         # Missile turrets at every mining base.
         if cfg["want_turrets"] and self.structures(UnitTypeId.ENGINEERINGBAY).ready:
@@ -791,19 +844,26 @@ class BattencruiserBot(BotAI):
                 if want_techlab:
                     techlab_total += 1
 
-        if cfg["tank_cap"] > 0:
-            for factory in self.structures(UnitTypeId.FACTORY).ready.idle:
-                if factory.has_add_on:
-                    continue
-                if self.can_afford(UnitTypeId.FACTORYTECHLAB) and self._addon_space_free(factory.position):
-                    factory.build(UnitTypeId.FACTORYTECHLAB)
+        army = getattr(self.strategy, "army", "mixed") if self.strategy else "mixed"
+        factory_labs = self.structures(UnitTypeId.FACTORYTECHLAB).amount
+        for factory in self.structures(UnitTypeId.FACTORY).ready.idle:
+            if factory.has_add_on or not self._addon_space_free(factory.position):
+                continue
+            want_lab = army in {"mech", "mixed"} and factory_labs < max(1, cfg["factory_cap"] - 1)
+            addon = UnitTypeId.FACTORYTECHLAB if want_lab else UnitTypeId.FACTORYREACTOR
+            if self.can_afford(addon):
+                factory.build(addon)
+                factory_labs += int(want_lab)
 
-        if cfg["medivac_cap"] > 1:
-            for port in self.structures(UnitTypeId.STARPORT).ready.idle:
-                if port.has_add_on:
-                    continue
-                if self.can_afford(UnitTypeId.STARPORTREACTOR) and self._addon_space_free(port.position):
-                    port.build(UnitTypeId.STARPORTREACTOR)
+        port_labs = self.structures(UnitTypeId.STARPORTTECHLAB).amount
+        for port in self.structures(UnitTypeId.STARPORT).ready.idle:
+            if port.has_add_on or not self._addon_space_free(port.position):
+                continue
+            want_lab = army in {"sky", "mixed"} and port_labs < max(1, cfg["starport_cap"] - 1)
+            addon = UnitTypeId.STARPORTTECHLAB if want_lab else UnitTypeId.STARPORTREACTOR
+            if self.can_afford(addon):
+                port.build(addon)
+                port_labs += int(want_lab)
 
     async def manage_upgrades(self, cfg):
         if self.active_build == "proxy_2rax":
@@ -846,14 +906,18 @@ class BattencruiserBot(BotAI):
         reactor_tags = self.structures(UnitTypeId.BARRACKSREACTOR).tags
         techlab_tags = self.structures(UnitTypeId.BARRACKSTECHLAB).tags
         port_reactor_tags = self.structures(UnitTypeId.STARPORTREACTOR).tags
+        port_techlab_tags = self.structures(UnitTypeId.STARPORTTECHLAB).tags
         fact_techlab_tags = self.structures(UnitTypeId.FACTORYTECHLAB).tags
+        fact_reactor_tags = self.structures(UnitTypeId.FACTORYREACTOR).tags
+        army_plan = getattr(self.strategy, "army", "mixed") if self.strategy else "mixed"
 
-        # Vikings when the enemy commits to air.
-        viking_target = 0
-        if self._max_air_threat >= 3:
-            viking_target = min(12, self._max_air_threat + 1 + 2 * self._heavy_air_seen)
+        viking_target = min(12, max(2 if army_plan == "sky" else 0, self._max_air_threat + 1 + 2 * self._heavy_air_seen))
         vikings_have = self.units.of_type(VIKING_TYPES).amount + self.already_pending(UnitTypeId.VIKINGFIGHTER)
         medivacs_have = self.units(UnitTypeId.MEDIVAC).amount + self.already_pending(UnitTypeId.MEDIVAC)
+        ravens = self.units(UnitTypeId.RAVEN).amount + self.already_pending(UnitTypeId.RAVEN)
+        banshees = self.units(UnitTypeId.BANSHEE).amount + self.already_pending(UnitTypeId.BANSHEE)
+        liberators = self.units.of_type({UnitTypeId.LIBERATOR, UnitTypeId.LIBERATORAG}).amount + self.already_pending(UnitTypeId.LIBERATOR)
+        battlecruisers = self.units(UnitTypeId.BATTLECRUISER).amount + self.already_pending(UnitTypeId.BATTLECRUISER)
 
         for port in self.structures(UnitTypeId.STARPORT).ready:
             if self.supply_left < 2:
@@ -861,21 +925,57 @@ class BattencruiserBot(BotAI):
             can_queue = port.is_idle or (port.add_on_tag in port_reactor_tags and len(port.orders) < 2)
             if not can_queue:
                 continue
-            if vikings_have < viking_target and self.can_afford(UnitTypeId.VIKINGFIGHTER):
+            if (
+                port.add_on_tag in port_techlab_tags
+                and self.structures(UnitTypeId.FUSIONCORE).ready
+                and battlecruisers < max(1, self.townhalls.amount // 2)
+                and self.supply_left >= 6
+                and self.can_afford(UnitTypeId.BATTLECRUISER)
+            ):
+                port.train(UnitTypeId.BATTLECRUISER)
+                battlecruisers += 1
+            elif port.add_on_tag in port_techlab_tags and ravens < 2 and self.can_afford(UnitTypeId.RAVEN):
+                port.train(UnitTypeId.RAVEN)
+                ravens += 1
+            elif port.add_on_tag in port_techlab_tags and banshees <= liberators and self.can_afford(UnitTypeId.BANSHEE):
+                port.train(UnitTypeId.BANSHEE)
+                banshees += 1
+            elif vikings_have < viking_target and self.can_afford(UnitTypeId.VIKINGFIGHTER):
                 port.train(UnitTypeId.VIKINGFIGHTER)
                 vikings_have += 1
             elif cfg["medivac_cap"] > 0 and medivacs_have < cfg["medivac_cap"] and self.can_afford(UnitTypeId.MEDIVAC):
                 port.train(UnitTypeId.MEDIVAC)
                 medivacs_have += 1
+            elif army_plan in {"sky", "mixed"} and self.can_afford(UnitTypeId.LIBERATOR):
+                port.train(UnitTypeId.LIBERATOR)
+                liberators += 1
 
-        if cfg["tank_cap"] > 0:
-            tanks = self.units.of_type(TANK_TYPES).amount + self.already_pending(UnitTypeId.SIEGETANK)
-            for factory in self.structures(UnitTypeId.FACTORY).ready.idle:
-                if tanks >= cfg["tank_cap"] or self.supply_left < 3:
-                    break
-                if factory.add_on_tag in fact_techlab_tags and self.can_afford(UnitTypeId.SIEGETANK):
+        tanks = self.units.of_type(TANK_TYPES).amount + self.already_pending(UnitTypeId.SIEGETANK)
+        cyclones = self.units(UnitTypeId.CYCLONE).amount + self.already_pending(UnitTypeId.CYCLONE)
+        thors = self.units(UnitTypeId.THOR).amount + self.already_pending(UnitTypeId.THOR)
+        hellions = self.units.of_type({UnitTypeId.HELLION, UnitTypeId.HELLIONTANK}).amount + self.already_pending(UnitTypeId.HELLION)
+        mines = self.units.of_type({UnitTypeId.WIDOWMINE, UnitTypeId.WIDOWMINEBURROWED}).amount + self.already_pending(UnitTypeId.WIDOWMINE)
+        for factory in self.structures(UnitTypeId.FACTORY).ready:
+            can_queue = factory.is_idle or (factory.add_on_tag in fact_reactor_tags and len(factory.orders) < 2)
+            if not can_queue or self.supply_left < 2:
+                continue
+            if factory.add_on_tag in fact_techlab_tags:
+                if self.structures(UnitTypeId.ARMORY).ready and thors <= tanks // 2 and self.supply_left >= 6 and self.can_afford(UnitTypeId.THOR):
+                    factory.train(UnitTypeId.THOR)
+                    thors += 1
+                elif tanks < cfg["tank_cap"] and tanks <= cyclones and self.supply_left >= 3 and self.can_afford(UnitTypeId.SIEGETANK):
                     factory.train(UnitTypeId.SIEGETANK)
                     tanks += 1
+                elif army_plan in {"mech", "mixed"} and self.can_afford(UnitTypeId.CYCLONE):
+                    factory.train(UnitTypeId.CYCLONE)
+                    cyclones += 1
+            elif army_plan in {"mech", "mixed"}:
+                if mines <= hellions // 3 and self.can_afford(UnitTypeId.WIDOWMINE):
+                    factory.train(UnitTypeId.WIDOWMINE)
+                    mines += 1
+                elif self.can_afford(UnitTypeId.HELLION):
+                    factory.train(UnitTypeId.HELLION)
+                    hellions += 1
 
         for rax in self.structures(UnitTypeId.BARRACKS).ready:
             if self.supply_left < 1:
@@ -888,7 +988,13 @@ class BattencruiserBot(BotAI):
                     or (self.strategy and self.strategy.tech == "marauder_bio")
                 )
                 if rax.is_idle:
-                    if prefer_marauder and self.can_afford(UnitTypeId.MARAUDER) and self.vespene >= 25:
+                    ghosts = self.units(UnitTypeId.GHOST).amount + self.already_pending(UnitTypeId.GHOST)
+                    reapers = self.units(UnitTypeId.REAPER).amount + self.already_pending(UnitTypeId.REAPER)
+                    if self.structures(UnitTypeId.GHOSTACADEMY).ready and ghosts < 2 and self.can_afford(UnitTypeId.GHOST):
+                        rax.train(UnitTypeId.GHOST)
+                    elif reapers < 2 and self.can_afford(UnitTypeId.REAPER):
+                        rax.train(UnitTypeId.REAPER)
+                    elif prefer_marauder and self.can_afford(UnitTypeId.MARAUDER) and self.vespene >= 25:
                         rax.train(UnitTypeId.MARAUDER)
                     elif self.can_afford(UnitTypeId.MARINE):
                         rax.train(UnitTypeId.MARINE)
@@ -1162,6 +1268,7 @@ class BattencruiserBot(BotAI):
 
         build = self.active_build
         t = self.time
+        combat_count = bio.amount if build == "proxy_2rax" else army.amount
 
         # Attack / regroup state machine.
         if build == "proxy_2rax":
@@ -1171,11 +1278,11 @@ class BattencruiserBot(BotAI):
             if (
                 not self.attack_mode
                 and t > self._retreat_until
-                and bio.amount >= cfg["attack_min_bio"] * (1 + 0.15 * min(3, self._retreat_count))
+                and combat_count >= cfg["attack_min_bio"] * (1 + 0.15 * min(3, self._retreat_count))
                 and (self._stim_ready or t > 380 or (getattr(self.strategy, "production", "") == "3rax" and t > 320))
             ):
                 self.attack_mode = True
-            if self.attack_mode and bio.amount <= cfg["retreat_bio"]:
+            if self.attack_mode and combat_count <= cfg["retreat_bio"]:
                 self.attack_mode = False
                 self._retreat_until = t + 10
                 self._retreat_count += 1
@@ -1183,8 +1290,8 @@ class BattencruiserBot(BotAI):
                 self.attack_mode = True
 
         # Fight-or-flee: disengage clearly losing fights (never during all-ins).
-        if self.attack_mode and not self.all_in and bio:
-            center = bio.center
+        if self.attack_mode and not self.all_in and army:
+            center = army.center
             local_enemies = self._cached_enemies.closer_than(22, center)
             if local_enemies.amount >= 3:
                 ours = self._our_power(army.closer_than(22, center))

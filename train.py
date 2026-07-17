@@ -78,7 +78,9 @@ def main():
     parser.add_argument("--hours", type=float, default=8.0, help="How long to train (wall clock)")
     parser.add_argument("--games", type=int, default=0, help="Stop after N games instead")
     parser.add_argument("--map", type=str, default=None, help="Force one map")
-    parser.add_argument("--match-timeout", type=int, default=2400,
+    parser.add_argument("--game-time-limit", type=int, default=10800,
+                        help="Maximum in-game seconds per match (default 3 game-hours)")
+    parser.add_argument("--match-timeout", type=int, default=5400,
                         help="Real-time seconds before a match subprocess is killed")
     args = parser.parse_args()
 
@@ -118,7 +120,8 @@ def main():
             try:
                 proc = subprocess.run(
                     [sys.executable, os.path.join(HERE, "play_match.py"),
-                     "--bot1", bot_a, "--bot2", bot_b, "--map", game_map],
+                     "--bot1", bot_a, "--bot2", bot_b, "--map", game_map,
+                     "--game-time-limit", str(args.game_time_limit)],
                     capture_output=True, text=True, timeout=args.match_timeout,
                 )
                 out = proc.stdout or ""

@@ -14,7 +14,7 @@ import random
 import tempfile
 import time
 
-DIMS = {'pool_timing': ['pool16', 'pool12', 'hatch_first'], 'gas_open': ['one_gas', 'no_gas', 'two_gas'], 'aggression': ['standard', 'early', 'very_early', 'late', 'very_late'], 'greed': ['standard', 'greedy', 'lean'], 'tech': ['roach_focus', 'hydra_focus', 'ling_flood']}
+DIMS = {'pool_timing': ['pool16', 'pool12', 'hatch_first'], 'gas_open': ['one_gas', 'no_gas', 'two_gas'], 'aggression': ['standard', 'early', 'very_early', 'late', 'very_late'], 'greed': ['standard', 'greedy', 'lean'], 'tech': ['roach_focus', 'hydra_focus', 'ling_flood'], 'army': ['swarm', 'ranged', 'sky', 'hive']}
 
 AGGRESSION_MULTS = {"standard": 1.0, "early": 0.75, "very_early": 0.55, "late": 1.3, "very_late": 1.7}
 GREED_PARAMS = {"standard": (1.0, 0), "greedy": (1.15, 50), "lean": (0.85, -60)}

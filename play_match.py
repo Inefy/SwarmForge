@@ -42,8 +42,8 @@ def main():
     parser.add_argument("--bot1", required=True, choices=sorted(BOTS))
     parser.add_argument("--bot2", required=True, choices=sorted(BOTS))
     parser.add_argument("--map", required=True)
-    parser.add_argument("--game-time-limit", type=int, default=1800,
-                        help="Max game duration in in-game seconds (default 30 game-minutes)")
+    parser.add_argument("--game-time-limit", type=int, default=10800,
+                        help="Max game duration in in-game seconds (default 3 game-hours)")
     args = parser.parse_args()
 
     # Learning data is written to ./data relative to cwd - keep it at the arena root.

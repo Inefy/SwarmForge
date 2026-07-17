@@ -23,7 +23,13 @@ from sc2.position import Point2
 
 from bot.strategy import StrategyManager
 
-ARMY_TYPES = {UnitTypeId.ZERGLING, UnitTypeId.ROACH, UnitTypeId.HYDRALISK}
+MELEE_TYPES = {UnitTypeId.ZERGLING, UnitTypeId.BANELING, UnitTypeId.ULTRALISK}
+ARMY_TYPES = MELEE_TYPES | {
+    UnitTypeId.ROACH, UnitTypeId.RAVAGER, UnitTypeId.HYDRALISK,
+    UnitTypeId.LURKERMP, UnitTypeId.LURKERMPBURROWED, UnitTypeId.INFESTOR,
+    UnitTypeId.SWARMHOSTMP, UnitTypeId.MUTALISK, UnitTypeId.CORRUPTOR,
+    UnitTypeId.VIPER, UnitTypeId.BROODLORD,
+}
 WORKER_TYPES = {UnitTypeId.SCV, UnitTypeId.PROBE, UnitTypeId.DRONE, UnitTypeId.MULE}
 IGNORE_TARGETS = {UnitTypeId.LARVA, UnitTypeId.EGG, UnitTypeId.BROODLING, UnitTypeId.INTERCEPTOR}
 SCOUT_IGNORE = {UnitTypeId.OVERLORD, UnitTypeId.OVERSEER, UnitTypeId.OBSERVER}
@@ -168,11 +174,7 @@ class ZaclingBot(BotAI):
         return self._rushing or self.supply_used > 190 or not self.townhalls
 
     def _army_supply_est(self):
-        return (
-            0.5 * self.units(UnitTypeId.ZERGLING).amount
-            + 2 * self.units(UnitTypeId.ROACH).amount
-            + 2 * self.units(UnitTypeId.HYDRALISK).amount
-        )
+        return float(self.supply_army)
 
     def _base_build_config(self):
         t = self.time
@@ -185,6 +187,8 @@ class ZaclingBot(BotAI):
                 want_warren=False, want_lair=False, want_den=False,
                 evo_count=0, want_spines=False,
                 attack_min=2, retreat_at=0, ling_only=True,
+                want_bane=False, want_infest=False, want_spire=False,
+                want_lurker=False, want_hive=False, want_ultra=False,
             )
         developed = bases >= 2 or t > 330
         if not developed:
@@ -206,6 +210,8 @@ class ZaclingBot(BotAI):
             evo_count=evo_count,
             want_spines=self.enemy_rush_detected,
             attack_min=26, retreat_at=12, ling_only=False,
+            want_bane=False, want_infest=False, want_spire=False,
+            want_lurker=False, want_hive=False, want_ultra=False,
         )
 
     def build_config(self):
@@ -232,6 +238,31 @@ class ZaclingBot(BotAI):
                         cfg["gas_target"] = max(cfg["gas_target"], 3)
                 elif tech == "ling_flood":
                     cfg["gas_target"] = min(cfg["gas_target"], 1)
+                army = getattr(self.strategy, "army", "ranged")
+                if army == "swarm":
+                    cfg["want_bane"] = self.time > 160
+                    cfg["want_infest"] = self.time > 440
+                    cfg["gas_target"] = max(cfg["gas_target"], 3)
+                elif army == "ranged":
+                    cfg["want_lair"] = self.time > 200
+                    cfg["want_den"] = self.time > 250
+                    cfg["want_lurker"] = self.time > 460
+                    cfg["gas_target"] = max(cfg["gas_target"], 4)
+                elif army == "sky":
+                    cfg["want_lair"] = self.time > 190
+                    cfg["want_spire"] = self.time > 330
+                    cfg["want_infest"] = self.time > 520
+                    cfg["want_hive"] = self.time > 620
+                    cfg["gas_target"] = max(cfg["gas_target"], 6)
+                else:
+                    cfg["want_lair"] = self.time > 190
+                    cfg["want_den"] = self.time > 260
+                    cfg["want_infest"] = self.time > 380
+                    cfg["want_lurker"] = self.time > 460
+                    cfg["want_hive"] = self.time > 540
+                    cfg["want_ultra"] = self.time > 650
+                    cfg["want_spire"] = self.time > 440
+                    cfg["gas_target"] = max(cfg["gas_target"], 6)
         except Exception:
             pass
         return cfg
@@ -270,6 +301,7 @@ class ZaclingBot(BotAI):
 
         cfg = self.build_config()
         await self._safe(self.manage_larva(cfg))
+        await self._safe(self.manage_morphs(cfg))
         await self._safe(self.manage_queens(cfg))
         await self._safe(self.manage_gas(cfg))
         await self._safe(self.manage_expansion(cfg))
@@ -432,18 +464,15 @@ class ZaclingBot(BotAI):
                 larvae.random.train(UnitTypeId.DRONE)
                 if larvae.amount <= 1:
                     return
-        # Army from remaining larva
+        # Army from remaining larva. The learned army plan opens the whole tech tree.
         pool_ready = bool(self.structures(UnitTypeId.SPAWNINGPOOL).ready)
         warren_ready = bool(self.structures(UnitTypeId.ROACHWARREN).ready)
         den_ready = bool(self.structures(UnitTypeId.HYDRALISKDEN).ready)
-        hydras = self.units(UnitTypeId.HYDRALISK).amount + self.already_pending(UnitTypeId.HYDRALISK)
-        roaches = self.units(UnitTypeId.ROACH).amount + self.already_pending(UnitTypeId.ROACH)
-        prefer_hydra = (
-            self._max_air_threat >= 3
-            or self._armored_seen_max < self._light_seen_max
-            or (self.strategy and self.strategy.tech == "hydra_focus")
-        )
-        ling_flood = bool(self.strategy and self.strategy.tech == "ling_flood")
+        pit_ready = bool(self.structures(UnitTypeId.INFESTATIONPIT).ready)
+        spire_ready = bool(self.structures.of_type({UnitTypeId.SPIRE, UnitTypeId.GREATERSPIRE}).ready)
+        hive_ready = bool(self.townhalls(UnitTypeId.HIVE).ready)
+        ultra_ready = bool(self.structures(UnitTypeId.ULTRALISKCAVERN).ready)
+        army_plan = getattr(self.strategy, "army", "ranged") if self.strategy else "ranged"
         for larva in larvae:
             if self.supply_left < 1:
                 break
@@ -451,20 +480,74 @@ class ZaclingBot(BotAI):
                 if pool_ready and self.can_afford(UnitTypeId.ZERGLING):
                     larva.train(UnitTypeId.ZERGLING)
                 continue
-            if ling_flood and pool_ready and self.minerals < 700 and self.can_afford(UnitTypeId.ZERGLING):
-                larva.train(UnitTypeId.ZERGLING)
-                continue
-            if den_ready and self.supply_left >= 2 and (prefer_hydra or hydras <= roaches):
-                if self.can_afford(UnitTypeId.HYDRALISK) and self.vespene >= 50:
-                    larva.train(UnitTypeId.HYDRALISK)
-                    hydras += 1
-                    continue
-            if warren_ready and self.supply_left >= 2 and self.can_afford(UnitTypeId.ROACH) and self.vespene >= 25:
-                larva.train(UnitTypeId.ROACH)
-                roaches += 1
-                continue
-            if pool_ready and self.can_afford(UnitTypeId.ZERGLING) and self.minerals > 75:
-                larva.train(UnitTypeId.ZERGLING)
+            choices = []
+            if army_plan == "swarm":
+                if pool_ready:
+                    choices.append(UnitTypeId.ZERGLING)
+                if pit_ready:
+                    choices += [UnitTypeId.INFESTOR, UnitTypeId.SWARMHOSTMP]
+            elif army_plan == "ranged":
+                if warren_ready:
+                    choices.append(UnitTypeId.ROACH)
+                if den_ready:
+                    choices.append(UnitTypeId.HYDRALISK)
+            elif army_plan == "sky":
+                if spire_ready:
+                    choices += [UnitTypeId.MUTALISK, UnitTypeId.CORRUPTOR]
+                if hive_ready:
+                    choices.append(UnitTypeId.VIPER)
+            else:
+                if ultra_ready:
+                    choices.append(UnitTypeId.ULTRALISK)
+                if pit_ready:
+                    choices += [UnitTypeId.INFESTOR, UnitTypeId.SWARMHOSTMP]
+                if hive_ready:
+                    choices.append(UnitTypeId.VIPER)
+                if den_ready:
+                    choices.append(UnitTypeId.HYDRALISK)
+                if spire_ready:
+                    choices.append(UnitTypeId.CORRUPTOR)
+            if pool_ready:
+                choices.append(UnitTypeId.ZERGLING)
+            choices.sort(key=lambda u: self.units(u).amount + self.already_pending(u))
+            choice = next((u for u in choices if self.can_afford(u)), None)
+            if choice is not None:
+                larva.train(choice)
+
+    async def manage_morphs(self, cfg):
+        army_plan = getattr(self.strategy, "army", "ranged") if self.strategy else "ranged"
+        if cfg["want_bane"] and self.structures(UnitTypeId.BANELINGNEST).ready:
+            target = max(2, self.units(UnitTypeId.ZERGLING).amount // 4)
+            existing = self.units(UnitTypeId.BANELING).amount + self.already_pending(UnitTypeId.BANELING)
+            for ling in self.units(UnitTypeId.ZERGLING).idle:
+                if existing >= target or not self.can_afford(UnitTypeId.BANELING):
+                    break
+                ling(AbilityId.MORPHZERGLINGTOBANELING_BANELING)
+                existing += 1
+        if army_plan in {"ranged", "hive"}:
+            target = max(2, self.units(UnitTypeId.ROACH).amount // 4)
+            existing = self.units(UnitTypeId.RAVAGER).amount + self.already_pending(UnitTypeId.RAVAGER)
+            for roach in self.units(UnitTypeId.ROACH).idle:
+                if existing >= target or not self.can_afford(UnitTypeId.RAVAGER):
+                    break
+                roach(AbilityId.MORPHTORAVAGER_RAVAGER)
+                existing += 1
+        if cfg["want_lurker"] and self.structures(UnitTypeId.LURKERDENMP).ready:
+            target = max(2, self.units(UnitTypeId.HYDRALISK).amount // 3)
+            existing = self.units(UnitTypeId.LURKERMP).amount + self.already_pending(UnitTypeId.LURKERMP)
+            for hydra in self.units(UnitTypeId.HYDRALISK).idle:
+                if existing >= target or not self.can_afford(UnitTypeId.LURKERMP):
+                    break
+                hydra(AbilityId.MORPH_LURKER)
+                existing += 1
+        if self.structures(UnitTypeId.GREATERSPIRE).ready and army_plan in {"sky", "hive"}:
+            target = max(2, self.units(UnitTypeId.CORRUPTOR).amount // 2)
+            existing = self.units(UnitTypeId.BROODLORD).amount + self.already_pending(UnitTypeId.BROODLORD)
+            for corruptor in self.units(UnitTypeId.CORRUPTOR).idle:
+                if existing >= target or not self.can_afford(UnitTypeId.BROODLORD):
+                    break
+                corruptor(AbilityId.MORPHTOBROODLORD_BROODLORD)
+                existing += 1
 
     async def manage_queens(self, cfg):
         pool_ready = bool(self.structures(UnitTypeId.SPAWNINGPOOL).ready)
@@ -592,6 +675,44 @@ class ZaclingBot(BotAI):
             count = self.structures(UnitTypeId.HYDRALISKDEN).amount + self.already_pending(UnitTypeId.HYDRALISKDEN)
             if count == 0 and self.can_afford(UnitTypeId.HYDRALISKDEN):
                 await self._build_near(UnitTypeId.HYDRALISKDEN, near)
+
+        if cfg["want_bane"] and pool_ready:
+            count = self.structures(UnitTypeId.BANELINGNEST).amount + self.already_pending(UnitTypeId.BANELINGNEST)
+            if count == 0 and self.can_afford(UnitTypeId.BANELINGNEST):
+                await self._build_near(UnitTypeId.BANELINGNEST, near)
+
+        lair_ready = bool(self.townhalls.of_type({UnitTypeId.LAIR, UnitTypeId.HIVE}).ready)
+        if cfg["want_infest"] and lair_ready:
+            count = self.structures(UnitTypeId.INFESTATIONPIT).amount + self.already_pending(UnitTypeId.INFESTATIONPIT)
+            if count == 0 and self.can_afford(UnitTypeId.INFESTATIONPIT):
+                await self._build_near(UnitTypeId.INFESTATIONPIT, near)
+
+        if cfg["want_spire"] and lair_ready:
+            count = self.structures.of_type({UnitTypeId.SPIRE, UnitTypeId.GREATERSPIRE}).amount + self.already_pending(UnitTypeId.SPIRE)
+            if count == 0 and self.can_afford(UnitTypeId.SPIRE):
+                await self._build_near(UnitTypeId.SPIRE, near)
+
+        if cfg["want_lurker"] and self.structures(UnitTypeId.HYDRALISKDEN).ready and lair_ready:
+            count = self.structures(UnitTypeId.LURKERDENMP).amount + self.already_pending(UnitTypeId.LURKERDENMP)
+            if count == 0 and self.can_afford(UnitTypeId.LURKERDENMP):
+                await self._build_near(UnitTypeId.LURKERDENMP, near)
+
+        if cfg["want_hive"] and self.structures(UnitTypeId.INFESTATIONPIT).ready:
+            if not self.townhalls(UnitTypeId.HIVE) and self.already_pending(UnitTypeId.HIVE) == 0:
+                lairs = self.townhalls(UnitTypeId.LAIR).ready.idle
+                if lairs and self.can_afford(UnitTypeId.HIVE):
+                    lairs.first(AbilityId.UPGRADETOHIVE_HIVE)
+
+        if self.townhalls(UnitTypeId.HIVE).ready and cfg["want_spire"]:
+            if not self.structures(UnitTypeId.GREATERSPIRE) and self.already_pending(UnitTypeId.GREATERSPIRE) == 0:
+                spires = self.structures(UnitTypeId.SPIRE).ready.idle
+                if spires and self.can_afford(UnitTypeId.GREATERSPIRE):
+                    spires.first(AbilityId.UPGRADETOGREATERSPIRE_GREATERSPIRE)
+
+        if cfg["want_ultra"] and self.townhalls(UnitTypeId.HIVE).ready:
+            count = self.structures(UnitTypeId.ULTRALISKCAVERN).amount + self.already_pending(UnitTypeId.ULTRALISKCAVERN)
+            if count == 0 and self.can_afford(UnitTypeId.ULTRALISKCAVERN):
+                await self._build_near(UnitTypeId.ULTRALISKCAVERN, near)
 
         # Evolution chambers
         if cfg["evo_count"] > 0 and pool_ready:
@@ -903,7 +1024,15 @@ class ZaclingBot(BotAI):
             ):
                 unit.move(center)
                 continue
-            if unit.type_id == UnitTypeId.ZERGLING:
+            if unit.type_id == UnitTypeId.LURKERMP:
+                if self._cached_enemies.closer_than(10, unit):
+                    unit(AbilityId.BURROWDOWN_LURKER)
+                else:
+                    unit.move(target)
+            elif unit.type_id == UnitTypeId.LURKERMPBURROWED:
+                if not self._cached_enemies.closer_than(12, unit) and unit.distance_to(target) > 14:
+                    unit(AbilityId.BURROWUP_LURKER)
+            elif unit.type_id in MELEE_TYPES:
                 self._micro_melee(unit, target)
             else:
                 self._micro_ranged(unit, target)
