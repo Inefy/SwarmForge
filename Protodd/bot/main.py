@@ -100,6 +100,8 @@ class ProtoddBot(BotAI):
         self._splash_threat = False
         self._first_pressure_recorded = False
         self._point_order_cache = {}
+        self._stats = {}
+        self._retreat_count = 0
         self._cached_enemies = None
         self._cached_army_for_spread = None
         self._dodge_zones = []
@@ -215,11 +217,23 @@ class ProtoddBot(BotAI):
         try:
             if self.strategy:
                 cfg["attack_min"] = max(2, int(round(cfg["attack_min"] * self.strategy.aggression_mult)))
+                cfg["probe_cap"] = max(12, int(round(cfg["probe_cap"] * self.strategy.greed_worker_mult)))
         except Exception:
             pass
         if (self.cloak_threat or self._max_air_threat >= 3) and self.active_build != "proxy_gates":
             cfg["want_forge"] = cfg["want_forge"] or self.time > 160
             cfg["observer_cap"] = max(cfg["observer_cap"], 1)
+        # Learned tech focus.
+        try:
+            tech = self.strategy.tech if self.strategy else "blink_stalker"
+            if self.active_build != "proxy_gates":
+                if tech == "immortal_core":
+                    cfg["immortal_cap"] = max(cfg["immortal_cap"], 6)
+                    cfg["want_robo"] = cfg["want_robo"] or self.time > 200
+                elif tech == "chargelot":
+                    cfg["want_twilight"] = cfg["want_twilight"] or self.time > 240
+        except Exception:
+            pass
         return cfg
 
     # ------------------------------------------------------------------ frame
@@ -234,10 +248,7 @@ class ProtoddBot(BotAI):
         if not self.greeted and iteration >= 2:
             self.greeted = True
             try:
-                await self.chat_send("(glhf) Protodd online.")
-                if self.strategy:
-                    await self.chat_send("Tag:" + self.strategy.build)
-                    await self.chat_send("Tag:aggr_" + self.strategy.aggression)
+                await self.chat_send("(glhf)")
             except Exception:
                 pass
 
@@ -271,6 +282,7 @@ class ProtoddBot(BotAI):
         await self._safe(self.manage_defense())
         await self._safe(self.control_army(cfg))
         if iteration % 16 == 0:
+            self._track_stats()
             await self._safe(self.distribute_workers())
 
     async def _safe(self, coro):
@@ -282,7 +294,21 @@ class ProtoddBot(BotAI):
     async def on_end(self, game_result):
         try:
             if self.strategy:
-                self.strategy.report(game_result == Result.Victory)
+                try:
+                    self._stats["retreats"] = self._retreat_count
+                except Exception:
+                    pass
+                self.strategy.report(game_result == Result.Victory, self._stats)
+        except Exception:
+            pass
+
+    def _track_stats(self):
+        try:
+            s = self._stats
+            s["peak_army_supply"] = max(s.get("peak_army_supply", 0), int(self.supply_army))
+            s["peak_workers"] = max(s.get("peak_workers", 0), int(self.supply_workers))
+            s["max_bases"] = max(s.get("max_bases", 0), self.townhalls.amount)
+            s["end_time"] = round(self.time, 1)
         except Exception:
             pass
 
@@ -329,7 +355,10 @@ class ProtoddBot(BotAI):
         )
 
         if not self.cloak_threat:
-            if enemies.filter(lambda u: u.is_cloaked or u.type_id in CLOAK_UNIT_HINTS):
+            if enemies.filter(
+                lambda u: (u.is_cloaked and u.type_id not in SCOUT_IGNORE)
+                or u.type_id in CLOAK_UNIT_HINTS
+            ):
                 self.cloak_threat = self._cloak_seen_live = True
             elif self.enemy_structures.of_type(CLOAK_STRUCT_HINTS):
                 self.cloak_threat = self._cloak_seen_live = True
@@ -458,7 +487,7 @@ class ProtoddBot(BotAI):
                     return
 
     def _wants_expand(self):
-        t = self.time
+        t = self.time + (self.strategy.greed_expand_shift if self.strategy else 0)
         build = self.active_build
         bases = self.townhalls.amount
         if build == "proxy_gates" or self._base_threats:
@@ -638,6 +667,8 @@ class ProtoddBot(BotAI):
                 return False
             if self.vespene < 50:
                 return False
+            if self.strategy and self.strategy.tech == "chargelot" and zealots <= stalkers:
+                return False
             return stalkers <= 3 * max(1, zealots) or self.active_build != "proxy_gates"
 
         # Warp-ins.
@@ -712,15 +743,18 @@ class ProtoddBot(BotAI):
             ):
                 core.research(UpgradeId.WARPGATERESEARCH)
 
+        first, second = UpgradeId.BLINKTECH, UpgradeId.CHARGE
+        if self.strategy and self.strategy.tech == "chargelot":
+            first, second = UpgradeId.CHARGE, UpgradeId.BLINKTECH
         for tc in self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready.idle:
-            if self.already_pending_upgrade(UpgradeId.BLINKTECH) == 0 and self.can_afford(UpgradeId.BLINKTECH):
-                tc.research(UpgradeId.BLINKTECH)
+            if self.already_pending_upgrade(first) == 0 and self.can_afford(first):
+                tc.research(first)
             elif (
-                self.already_pending_upgrade(UpgradeId.BLINKTECH) == 1
-                and self.already_pending_upgrade(UpgradeId.CHARGE) == 0
-                and self.can_afford(UpgradeId.CHARGE)
+                self.already_pending_upgrade(first) == 1
+                and self.already_pending_upgrade(second) == 0
+                and self.can_afford(second)
             ):
-                tc.research(UpgradeId.CHARGE)
+                tc.research(second)
 
         twilight_ready = bool(self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready)
         ground_upgrades = [
@@ -807,11 +841,19 @@ class ProtoddBot(BotAI):
                     assigned += 1
 
         ths = self.townhalls
-        threats = self.enemy_units.filter(
+        nearby = self.enemy_units.filter(
             lambda u: u.type_id not in SCOUT_IGNORE
             and u.type_id not in IGNORE_TARGETS
             and any(u.distance_to(th) < 25 for th in ths)
         )
+        real_threats = nearby.filter(lambda u: u.type_id not in WORKER_TYPES)
+        worker_intruders = nearby.of_type(WORKER_TYPES)
+        if real_threats:
+            threats = nearby if worker_intruders else real_threats
+        elif worker_intruders.amount >= 3:
+            threats = worker_intruders
+        else:
+            threats = None  # a lone scouting worker is not an invasion
         self._base_threats = threats if threats else None
         if threats and not self._first_pressure_recorded:
             self._first_pressure_recorded = True
@@ -946,11 +988,12 @@ class ProtoddBot(BotAI):
         else:
             wg_done = self.already_pending_upgrade(UpgradeId.WARPGATERESEARCH) == 1
             gate_ok = wg_done or t > 350
-            if not self.attack_mode and t > self._retreat_until and est >= cfg["attack_min"] and gate_ok:
+            if not self.attack_mode and t > self._retreat_until and gate_ok and est >= cfg["attack_min"] * (1 + 0.15 * min(3, self._retreat_count)):
                 self.attack_mode = True
             if self.attack_mode and est <= cfg["retreat_at"]:
                 self.attack_mode = False
                 self._retreat_until = t + 10
+                self._retreat_count += 1
             if self.supply_used > 190:
                 self.attack_mode = True
 
@@ -963,6 +1006,7 @@ class ProtoddBot(BotAI):
                 if theirs > ours * 1.4:
                     self.attack_mode = False
                     self._retreat_until = t + 12
+                    self._retreat_count += 1
 
         defending = self._base_threats is not None
         if defending:

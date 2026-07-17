@@ -16,6 +16,24 @@ bandit, threat fingerprinting with pre-adaptation), fight-or-flee combat
 evaluation, effect/baneling dodging, range-aware stutter micro, and splash
 spreading. See each bot folder's README/source for details.
 
+## What the bots learn (v4)
+
+Four independent dimensions are learned per opponent (~135 combinations),
+each scored 65% vs that opponent / 35% globally, with exploration noise so
+the bots keep experimenting instead of locking into one build:
+
+* **opening** - how the first minutes are spent
+* **aggression** - attack at 0.55x to 1.7x the normal army size
+* **greed** - worker counts and expansion timing (lean / standard / greedy)
+* **tech** - composition focus (e.g. marauder_bio, ling_flood, chargelot)
+
+They also adapt in-game (repelled attacks raise the next attack's size bar,
+unit mix follows the enemy's armored/light/air ratios) and fingerprint
+opponents between games. Every game is logged to `data/games_<bot>.jsonl`.
+
+Run `py -3 analyze.py` after training for standings, matchup grids,
+per-dimension winrates, and each bot's current best answer per opponent.
+
 ## Self-play training arena
 
 `train.py` runs the three bots against each other for hours, round-robin,

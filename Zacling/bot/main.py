@@ -100,6 +100,8 @@ class ZaclingBot(BotAI):
         self._splash_threat = False
         self._first_pressure_recorded = False
         self._point_order_cache = {}
+        self._stats = {}
+        self._retreat_count = 0
         self._cached_enemies = None
         self._cached_army_for_spread = None
         self._dodge_zones = []
@@ -208,6 +210,7 @@ class ZaclingBot(BotAI):
         try:
             if self.strategy:
                 cfg["attack_min"] = max(2, int(round(cfg["attack_min"] * self.strategy.aggression_mult)))
+                cfg["drone_cap"] = max(12, int(round(cfg["drone_cap"] * self.strategy.greed_worker_mult)))
         except Exception:
             pass
         # Known cloak/air opponents: lair + den + spores early.
@@ -215,6 +218,19 @@ class ZaclingBot(BotAI):
             if self.active_build != "twelve_pool":
                 cfg["want_lair"] = cfg["want_lair"] or self.time > 200
                 cfg["want_den"] = cfg["want_den"] or self.time > 240
+        # Learned tech focus.
+        try:
+            tech = self.strategy.tech if self.strategy else "roach_focus"
+            if self.active_build != "twelve_pool":
+                if tech == "hydra_focus":
+                    cfg["want_lair"] = cfg["want_lair"] or self.time > 220
+                    cfg["want_den"] = cfg["want_den"] or self.time > 260
+                    if self.time > 240:
+                        cfg["gas_target"] = max(cfg["gas_target"], 3)
+                elif tech == "ling_flood":
+                    cfg["gas_target"] = min(cfg["gas_target"], 1)
+        except Exception:
+            pass
         return cfg
 
     # ------------------------------------------------------------------ frame
@@ -229,10 +245,7 @@ class ZaclingBot(BotAI):
         if not self.greeted and iteration >= 2:
             self.greeted = True
             try:
-                await self.chat_send("(glhf) Zacling online.")
-                if self.strategy:
-                    await self.chat_send("Tag:" + self.strategy.build)
-                    await self.chat_send("Tag:aggr_" + self.strategy.aggression)
+                await self.chat_send("(glhf)")
             except Exception:
                 pass
 
@@ -263,6 +276,7 @@ class ZaclingBot(BotAI):
         await self._safe(self.manage_defense())
         await self._safe(self.control_army(cfg))
         if iteration % 16 == 0:
+            self._track_stats()
             await self._safe(self.distribute_workers())
 
     async def _safe(self, coro):
@@ -274,7 +288,21 @@ class ZaclingBot(BotAI):
     async def on_end(self, game_result):
         try:
             if self.strategy:
-                self.strategy.report(game_result == Result.Victory)
+                try:
+                    self._stats["retreats"] = self._retreat_count
+                except Exception:
+                    pass
+                self.strategy.report(game_result == Result.Victory, self._stats)
+        except Exception:
+            pass
+
+    def _track_stats(self):
+        try:
+            s = self._stats
+            s["peak_army_supply"] = max(s.get("peak_army_supply", 0), int(self.supply_army))
+            s["peak_workers"] = max(s.get("peak_workers", 0), int(self.supply_workers))
+            s["max_bases"] = max(s.get("max_bases", 0), self.townhalls.amount)
+            s["end_time"] = round(self.time, 1)
         except Exception:
             pass
 
@@ -321,7 +349,10 @@ class ZaclingBot(BotAI):
         )
 
         if not self.cloak_threat:
-            if enemies.filter(lambda u: u.is_cloaked or u.type_id in CLOAK_UNIT_HINTS):
+            if enemies.filter(
+                lambda u: (u.is_cloaked and u.type_id not in SCOUT_IGNORE)
+                or u.type_id in CLOAK_UNIT_HINTS
+            ):
                 self.cloak_threat = self._cloak_seen_live = True
             elif self.enemy_structures.of_type(CLOAK_STRUCT_HINTS):
                 self.cloak_threat = self._cloak_seen_live = True
@@ -404,13 +435,21 @@ class ZaclingBot(BotAI):
         den_ready = bool(self.structures(UnitTypeId.HYDRALISKDEN).ready)
         hydras = self.units(UnitTypeId.HYDRALISK).amount + self.already_pending(UnitTypeId.HYDRALISK)
         roaches = self.units(UnitTypeId.ROACH).amount + self.already_pending(UnitTypeId.ROACH)
-        prefer_hydra = self._max_air_threat >= 3 or self._armored_seen_max < self._light_seen_max
+        prefer_hydra = (
+            self._max_air_threat >= 3
+            or self._armored_seen_max < self._light_seen_max
+            or (self.strategy and self.strategy.tech == "hydra_focus")
+        )
+        ling_flood = bool(self.strategy and self.strategy.tech == "ling_flood")
         for larva in larvae:
             if self.supply_left < 1:
                 break
             if cfg["ling_only"]:
                 if pool_ready and self.can_afford(UnitTypeId.ZERGLING):
                     larva.train(UnitTypeId.ZERGLING)
+                continue
+            if ling_flood and pool_ready and self.minerals < 700 and self.can_afford(UnitTypeId.ZERGLING):
+                larva.train(UnitTypeId.ZERGLING)
                 continue
             if den_ready and self.supply_left >= 2 and (prefer_hydra or hydras <= roaches):
                 if self.can_afford(UnitTypeId.HYDRALISK) and self.vespene >= 50:
@@ -463,7 +502,7 @@ class ZaclingBot(BotAI):
                     return
 
     def _wants_expand(self):
-        t = self.time
+        t = self.time + (self.strategy.greed_expand_shift if self.strategy else 0)
         build = self.active_build
         bases = self.townhalls.amount
         if self._base_threats:
@@ -691,11 +730,19 @@ class ZaclingBot(BotAI):
                     assigned += 1
 
         ths = self.townhalls
-        threats = self.enemy_units.filter(
+        nearby = self.enemy_units.filter(
             lambda u: u.type_id not in SCOUT_IGNORE
             and u.type_id not in IGNORE_TARGETS
             and any(u.distance_to(th) < 25 for th in ths)
         )
+        real_threats = nearby.filter(lambda u: u.type_id not in WORKER_TYPES)
+        worker_intruders = nearby.of_type(WORKER_TYPES)
+        if real_threats:
+            threats = nearby if worker_intruders else real_threats
+        elif worker_intruders.amount >= 3:
+            threats = worker_intruders
+        else:
+            threats = None  # a lone scouting worker is not an invasion
         self._base_threats = threats if threats else None
         if threats and not self._first_pressure_recorded:
             self._first_pressure_recorded = True
@@ -805,11 +852,12 @@ class ZaclingBot(BotAI):
             if self.units(UnitTypeId.ZERGLING).amount >= cfg["attack_min"] or t > 150:
                 self.attack_mode = True
         else:
-            if not self.attack_mode and t > self._retreat_until and est >= cfg["attack_min"]:
+            if not self.attack_mode and t > self._retreat_until and est >= cfg["attack_min"] * (1 + 0.15 * min(3, self._retreat_count)):
                 self.attack_mode = True
             if self.attack_mode and est <= cfg["retreat_at"]:
                 self.attack_mode = False
                 self._retreat_until = t + 10
+                self._retreat_count += 1
             if self.supply_used > 190:
                 self.attack_mode = True
 
@@ -822,6 +870,7 @@ class ZaclingBot(BotAI):
                 if theirs > ours * 1.4:
                     self.attack_mode = False
                     self._retreat_until = t + 12
+                    self._retreat_count += 1
 
         defending = self._base_threats is not None
         if defending:

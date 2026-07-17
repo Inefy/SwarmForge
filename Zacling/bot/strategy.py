@@ -1,28 +1,45 @@
 """
-Per-opponent learning for Zacling, persisted between games via ./data.
+Open-ended per-opponent learning for Zacling, persisted via ./data.
 
-Three systems:
- 1. Build bandit   - win/loss per build per opponent (Laplace-smoothed winrate).
- 2. Timing bandit  - attack early / on time / late, learned per opponent.
- 3. Opponent profile - fingerprints rushes, worker rushes, cannon rushes, cloak,
-    air comps and earliest pressure so the NEXT game starts pre-adapted.
+Instead of one build bandit, FOUR independent learned dimensions combine into
+~135 possible ways to play, explored axis by axis:
+  * opening    - how the first minutes are spent
+  * aggression - how big an army before attacking (0.55x .. 1.7x)
+  * greed      - economy vs army: worker counts + expansion timing
+  * tech       - which unit composition to lean into
+
+Each arm is scored 65% by results vs THIS opponent, 35% by global results vs
+everyone, plus a small exploration bonus so the bot never stops experimenting.
+Opponent fingerprints (rushes, cloak, air, pressure timing) pre-adapt the next
+game, and every game is appended to data/games_zacling.jsonl for analysis.
 """
 
 import json
 import os
+import random
 import tempfile
+import time
 
-BUILDS = ['roach_timing', 'macro_hydra', 'twelve_pool']
-
+OPENINGS = ['roach_timing', 'macro_hydra', 'twelve_pool']
+BUILDS = OPENINGS  # alias used by run.py --build forcing
 RACE_PRIORITY = {'Zerg': ['twelve_pool', 'roach_timing', 'macro_hydra'], 'Terran': ['roach_timing', 'macro_hydra', 'twelve_pool'], 'Protoss': ['roach_timing', 'twelve_pool', 'macro_hydra'], 'Random': ['roach_timing', 'twelve_pool', 'macro_hydra']}
+RUSH_UNSAFE_OPENING = None
 
-RUSH_UNSAFE_BUILD = None
+AGGRESSION_ARMS = [
+    ("standard", 1.0), ("early", 0.75), ("very_early", 0.55),
+    ("late", 1.3), ("very_late", 1.7),
+]
+# (name, worker cap multiplier, expansion clock shift in seconds)
+GREED_ARMS = [("standard", 1.0, 0), ("greedy", 1.15, 50), ("lean", 0.85, -60)]
+TECH_ARMS = ['roach_focus', 'hydra_focus', 'ling_flood']
 
-AGGRESSION_ARMS = [("standard", 1.0), ("early", 0.7), ("late", 1.4)]
 PROFILE_FLAGS = ["rushed", "worker_rush", "cannon_rush", "cloak", "air"]
 
 DATA_DIR = "data"
 DATA_FILE = os.path.join(DATA_DIR, "strategies_zacling.json")
+GAME_LOG = os.path.join(DATA_DIR, "games_zacling.jsonl")
+GLOBAL_KEY = "__global__"
+EXPLORATION = 0.10
 
 
 def _laplace(wl):
@@ -33,14 +50,27 @@ def _laplace(wl):
 class StrategyManager:
     def __init__(self, opponent_id, enemy_race_name="Random"):
         self.opponent_id = str(opponent_id) if opponent_id else "unknown"
+        self.enemy_race_name = enemy_race_name
         self.priority = RACE_PRIORITY.get(enemy_race_name, RACE_PRIORITY["Random"])
         self.all_data = self._load()
-        self.record = self.all_data.get(self.opponent_id, {})
+        self.record = self._migrate(self.all_data.get(self.opponent_id, {}))
+        self.global_record = self._migrate(self.all_data.get(GLOBAL_KEY, {}))
         self.profile = self.record.get("profile", {})
         self.observed = {}
-        self.build = self._choose_build()
-        self.aggression, self.aggression_mult = self._choose_aggression()
+
+        self.build = self._choose("opening", self._opening_candidates())
+        self.opening = self.build
+        aggr = self._choose("aggression", [a[0] for a in AGGRESSION_ARMS])
+        self.aggression = aggr
+        self.aggression_mult = dict((n, m) for n, m in AGGRESSION_ARMS)[aggr]
+        greed = self._choose("greed", [g[0] for g in GREED_ARMS])
+        self.greed = greed
+        greed_info = dict((n, (m, s)) for n, m, s in GREED_ARMS)[greed]
+        self.greed_worker_mult, self.greed_expand_shift = greed_info
+        self.tech = self._choose("tech", list(TECH_ARMS))
         self.reported = False
+
+    # ---------------------------------------------------------------- storage
 
     @staticmethod
     def _load():
@@ -52,6 +82,21 @@ class StrategyManager:
         except Exception:
             pass
         return {}
+
+    @staticmethod
+    def _migrate(record):
+        """Upgrade v3 records (builds/aggr) to the v4 dims schema in place."""
+        try:
+            dims = record.setdefault("dims", {})
+            if "builds" in record and "opening" not in dims:
+                dims["opening"] = record["builds"]
+            if "aggr" in record and "aggression" not in dims:
+                dims["aggression"] = record["aggr"]
+        except Exception:
+            pass
+        return record
+
+    # --------------------------------------------------------------- profile
 
     def expects(self, flag, threshold=0.4):
         try:
@@ -78,45 +123,49 @@ class StrategyManager:
         except Exception:
             pass
 
-    def _choose_build(self):
-        builds = self.record.get("builds", {})
+    # --------------------------------------------------------------- choosing
+
+    def _opening_candidates(self):
         candidates = list(self.priority)
         if (
-            RUSH_UNSAFE_BUILD
+            RUSH_UNSAFE_OPENING
             and (self.expects("worker_rush") or self.expects("rushed"))
             and len(candidates) > 1
         ):
-            candidates = [c for c in candidates if c != RUSH_UNSAFE_BUILD] or candidates
+            candidates = [c for c in candidates if c != RUSH_UNSAFE_OPENING] or candidates
+        return candidates
+
+    def _choose(self, dim, candidates):
+        opp = self.record.get("dims", {}).get(dim, {})
+        glob = self.global_record.get("dims", {}).get(dim, {})
 
         def score(item):
             index, name = item
-            return (_laplace(builds.get(name, [0, 0])), -index)
+            s = 0.65 * _laplace(opp.get(name, [0, 0])) + 0.35 * _laplace(glob.get(name, [0, 0]))
+            s += random.uniform(0.0, EXPLORATION)     # keep experimenting
+            s += (len(candidates) - index) * 0.005    # tiny order bias for game 1
+            return s
 
         _, best = max(enumerate(candidates), key=score)
         return best
 
-    def _choose_aggression(self):
-        record = self.record.get("aggr", {})
+    # -------------------------------------------------------------- reporting
 
-        def score(item):
-            index, (name, _mult) = item
-            return (_laplace(record.get(name, [0, 0])), -index)
-
-        _, (name, mult) = max(enumerate(AGGRESSION_ARMS), key=score)
-        return name, mult
-
-    def report(self, won):
+    def report(self, won, stats=None):
         if self.reported:
             return
         self.reported = True
         try:
-            builds = self.record.setdefault("builds", {})
-            wl = builds.setdefault(self.build, [0, 0])
-            wl[0 if won else 1] += 1
-
-            aggr = self.record.setdefault("aggr", {})
-            awl = aggr.setdefault(self.aggression, [0, 0])
-            awl[0 if won else 1] += 1
+            picks = {
+                "opening": self.opening, "aggression": self.aggression,
+                "greed": self.greed, "tech": self.tech,
+            }
+            for record in (self.record, self.global_record):
+                dims = record.setdefault("dims", {})
+                for dim, arm in picks.items():
+                    wl = dims.setdefault(dim, {}).setdefault(arm, [0, 0])
+                    wl[0 if won else 1] += 1
+                record["games"] = int(record.get("games", 0)) + 1
 
             profile = self.record.setdefault("profile", {})
             profile["games"] = int(profile.get("games", 0)) + 1
@@ -130,11 +179,30 @@ class StrategyManager:
                 fp = float(self.observed["first_pressure"])
                 profile["first_pressure"] = fp if previous is None else min(float(previous), fp)
 
-            self.record["last_build"] = self.build
             self.record["last_result"] = "win" if won else "loss"
-            self.record["games"] = int(self.record.get("games", 0)) + 1
             self.all_data[self.opponent_id] = self.record
+            self.all_data[GLOBAL_KEY] = self.global_record
             self._save()
+            self._log_game(won, picks, stats)
+        except Exception:
+            pass
+
+    def _log_game(self, won, picks, stats):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            entry = {
+                "ts": int(time.time()),
+                "opponent": self.opponent_id,
+                "enemy_race": self.enemy_race_name,
+                "won": bool(won),
+            }
+            entry.update(picks)
+            if stats:
+                entry["stats"] = stats
+            if self.observed:
+                entry["observed"] = dict(self.observed)
+            with open(GAME_LOG, "a") as f:
+                f.write(json.dumps(entry) + "\n")
         except Exception:
             pass
 

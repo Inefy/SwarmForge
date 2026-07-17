@@ -135,6 +135,8 @@ class BattencruiserBot(BotAI):
         self._first_pressure_recorded = False
         self._cached_bio_for_spread = None
         self._point_order_cache = {}
+        self._stats = {}
+        self._retreat_count = 0
         self._tank_last_enemy = {}
         self._wall_positions = []
         self._rax_wall_position = None
@@ -213,12 +215,28 @@ class BattencruiserBot(BotAI):
                 cfg["attack_min_bio"] = max(
                     2, int(round(cfg["attack_min_bio"] * self.strategy.aggression_mult))
                 )
+                cfg["worker_cap"] = max(12, int(round(cfg["worker_cap"] * self.strategy.greed_worker_mult)))
         except Exception:
             pass
         # Known cloak/air opponents: detection and anti-air much earlier.
         if (self.cloak_threat or self._max_air_threat >= 3) and self.active_build != "proxy_2rax":
             cfg["want_ebay"] = cfg["want_ebay"] or self.time > 150
             cfg["want_turrets"] = True
+        # Learned tech focus.
+        try:
+            tech = self.strategy.tech if self.strategy else "tank_bio"
+            if self.active_build != "proxy_2rax":
+                if tech == "marine_bio":
+                    cfg["tank_cap"] = 0
+                    cfg["rax_cap"] = cfg["rax_cap"] + 1
+                elif tech == "tank_bio":
+                    if cfg["tank_cap"] > 0:
+                        cfg["tank_cap"] = 4
+                elif tech == "marauder_bio":
+                    cfg["techlab_cap"] = max(cfg["techlab_cap"], 2)
+                    cfg["marauder"] = True
+        except Exception:
+            pass
         return cfg
 
     def _base_build_config(self):
@@ -283,10 +301,7 @@ class BattencruiserBot(BotAI):
         if not self.greeted and iteration >= 2:
             self.greeted = True
             try:
-                await self.chat_send("(glhf) Battencruiser online.")
-                if self.strategy:
-                    await self.chat_send("Tag:" + self.strategy.build)
-                    await self.chat_send("Tag:aggr_" + self.strategy.aggression)
+                await self.chat_send("(glhf)")
             except Exception:
                 pass
 
@@ -326,6 +341,7 @@ class BattencruiserBot(BotAI):
         await self._safe(self.manage_depot_wall())
 
         if iteration % 16 == 0:
+            self._track_stats()
             await self._safe(self.distribute_workers())
 
     async def _safe(self, coro):
@@ -337,7 +353,21 @@ class BattencruiserBot(BotAI):
     async def on_end(self, game_result):
         try:
             if self.strategy:
-                self.strategy.report(game_result == Result.Victory)
+                try:
+                    self._stats["retreats"] = self._retreat_count
+                except Exception:
+                    pass
+                self.strategy.report(game_result == Result.Victory, self._stats)
+        except Exception:
+            pass
+
+    def _track_stats(self):
+        try:
+            s = self._stats
+            s["peak_army_supply"] = max(s.get("peak_army_supply", 0), int(self.supply_army))
+            s["peak_workers"] = max(s.get("peak_workers", 0), int(self.supply_workers))
+            s["max_bases"] = max(s.get("max_bases", 0), self.townhalls.amount)
+            s["end_time"] = round(self.time, 1)
         except Exception:
             pass
 
@@ -384,7 +414,10 @@ class BattencruiserBot(BotAI):
         )
 
         if not self.cloak_threat:
-            if enemies.filter(lambda u: u.is_cloaked or u.type_id in CLOAK_UNIT_HINTS):
+            if enemies.filter(
+                lambda u: (u.is_cloaked and u.type_id not in SCOUT_IGNORE)
+                or u.type_id in CLOAK_UNIT_HINTS
+            ):
                 self.cloak_threat = self._cloak_seen_live = True
             elif self.enemy_structures.of_type(CLOAK_STRUCT_HINTS):
                 self.cloak_threat = self._cloak_seen_live = True
@@ -557,7 +590,7 @@ class BattencruiserBot(BotAI):
                     return
 
     def _wants_expand(self, cfg):
-        t = self.time
+        t = self.time + (self.strategy.greed_expand_shift if self.strategy else 0)
         build = self.active_build
         bases = self.townhalls.amount
         if build == "proxy_2rax":
@@ -854,7 +887,9 @@ class BattencruiserBot(BotAI):
             if rax.add_on_tag in techlab_tags and cfg["marauder"]:
                 # Marauders against armored comps (roach/stalker/tank), marines vs light.
                 prefer_marauder = (
-                    self._armored_seen_max >= self._light_seen_max or self.vespene > 300
+                    self._armored_seen_max >= self._light_seen_max
+                    or self.vespene > 300
+                    or (self.strategy and self.strategy.tech == "marauder_bio")
                 )
                 if rax.is_idle:
                     if prefer_marauder and self.can_afford(UnitTypeId.MARAUDER) and self.vespene >= 25:
@@ -942,11 +977,19 @@ class BattencruiserBot(BotAI):
 
         # Track enemy forces near any of our bases.
         ths = self.townhalls
-        threats = self.enemy_units.filter(
+        nearby = self.enemy_units.filter(
             lambda u: u.type_id not in SCOUT_IGNORE
             and u.type_id not in IGNORE_TARGETS
             and any(u.distance_to(th) < 25 for th in ths)
         )
+        real_threats = nearby.filter(lambda u: u.type_id not in WORKER_TYPES)
+        worker_intruders = nearby.of_type(WORKER_TYPES)
+        if real_threats:
+            threats = nearby if worker_intruders else real_threats
+        elif worker_intruders.amount >= 3:
+            threats = worker_intruders
+        else:
+            threats = None  # a lone scouting worker is not an invasion
         self._base_threats = threats if threats else None
         if threats and not self._first_pressure_recorded:
             self._first_pressure_recorded = True
@@ -1132,13 +1175,14 @@ class BattencruiserBot(BotAI):
             if (
                 not self.attack_mode
                 and t > self._retreat_until
-                and bio.amount >= cfg["attack_min_bio"]
+                and bio.amount >= cfg["attack_min_bio"] * (1 + 0.15 * min(3, self._retreat_count))
                 and (self._stim_ready or t > 380 or (build == "three_rax" and t > 320))
             ):
                 self.attack_mode = True
             if self.attack_mode and bio.amount <= cfg["retreat_bio"]:
                 self.attack_mode = False
                 self._retreat_until = t + 10
+                self._retreat_count += 1
             if self.supply_used > 190:
                 self.attack_mode = True
 
@@ -1152,6 +1196,7 @@ class BattencruiserBot(BotAI):
                 if theirs > ours * 1.4:
                     self.attack_mode = False
                     self._retreat_until = t + 12
+                    self._retreat_count += 1
 
         # Where should the army be?
         defending = self._base_threats is not None

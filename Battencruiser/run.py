@@ -92,8 +92,14 @@ def run_local():
         forced = args.build
         if forced in strategy_module.BUILDS:
             original_choose = strategy_module.StrategyManager._choose
-            strategy_module.StrategyManager._choose = lambda self: forced
-            print("Forcing build:", forced)
+
+            def forced_choose(self, dim, candidates, _orig=original_choose, _forced=forced):
+                if dim == "opening":
+                    return _forced
+                return _orig(self, dim, candidates)
+
+            strategy_module.StrategyManager._choose = forced_choose
+            print("Forcing opening:", forced)
         else:
             print("Unknown build:", forced, "- valid:", strategy_module.BUILDS)
             sys.exit(1)
