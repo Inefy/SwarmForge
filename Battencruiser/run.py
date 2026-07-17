@@ -66,8 +66,8 @@ def run_local():
     parser.add_argument("--race", type=str, default="zerg", choices=sorted(RACES))
     parser.add_argument("--difficulty", type=str, default="veryhard", choices=sorted(DIFFICULTIES))
     parser.add_argument("--realtime", action="store_true", help="Watch in real time")
-    parser.add_argument("--build", type=str, default=None,
-                        help="Force a build: three_rax | bio_macro | proxy_2rax")
+    parser.add_argument("--force", type=str, default=None,
+                        help="Force learned dims, e.g. --force production=3rax,location=proxy")
     args, _unknown = parser.parse_known_args()
 
     candidates = [args.map] if args.map else LOCAL_MAP_CANDIDATES
@@ -86,23 +86,24 @@ def run_local():
         sys.exit(1)
 
     bot = make_bot()
-    if args.build:
-        # Force a specific build for testing by pre-seeding the strategy choice.
+    if args.force:
         import bot.strategy as strategy_module
-        forced = args.build
-        if forced in strategy_module.BUILDS:
-            original_choose = strategy_module.StrategyManager._choose
-
-            def forced_choose(self, dim, candidates, _orig=original_choose, _forced=forced):
-                if dim == "opening":
-                    return _forced
-                return _orig(self, dim, candidates)
-
-            strategy_module.StrategyManager._choose = forced_choose
-            print("Forcing opening:", forced)
-        else:
-            print("Unknown build:", forced, "- valid:", strategy_module.BUILDS)
+        forced = dict(kv.split("=", 1) for kv in args.force.split(","))
+        unknown = {d: a for d, a in forced.items()
+                   if d not in strategy_module.DIMS or a not in strategy_module.DIMS[d]}
+        if unknown:
+            print("Unknown dims/arms:", unknown)
+            print("Valid:", strategy_module.DIMS)
             sys.exit(1)
+        original_choose = strategy_module.StrategyManager._choose
+
+        def forced_choose(self, dim, candidates, _orig=original_choose, _f=forced):
+            if dim in _f:
+                return _f[dim]
+            return _orig(self, dim, candidates)
+
+        strategy_module.StrategyManager._choose = forced_choose
+        print("Forcing:", forced)
 
     print("Map: {} | vs {} {}".format(game_map.name, args.difficulty, args.race))
     run_game(

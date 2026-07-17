@@ -196,16 +196,21 @@ class BattencruiserBot(BotAI):
             self._rax_wall_position = None
 
     @property
+    def _proxying(self):
+        return (
+            bool(self.strategy)
+            and getattr(self.strategy, "location", "home") == "proxy"
+            and self.time < 420
+        )
+
+    @property
     def active_build(self):
-        build = self.strategy.build if self.strategy else "three_rax"
-        # If the proxy all-in did not end the game, fall back to macro behavior.
-        if build == "proxy_2rax" and self.time > 420:
-            return "three_rax"
-        return build
+        # Synthetic label: openings are now composed from learned parameters.
+        return "proxy_2rax" if self._proxying else "macro"
 
     @property
     def all_in(self):
-        return self.active_build == "proxy_2rax" or self.supply_used > 190 or not self.townhalls
+        return self._proxying or self.supply_used > 190 or not self.townhalls
 
     def build_config(self):
         cfg = self._base_build_config()
@@ -241,48 +246,38 @@ class BattencruiserBot(BotAI):
 
     def _base_build_config(self):
         t = self.time
-        build = self.active_build
-        if build == "proxy_2rax":
+        s = self.strategy
+        prod = {"1rax": 1, "2rax": 2, "3rax": 3}.get(getattr(s, "production", "2rax"), 2)
+        gas0 = {"no_gas": 0, "one_gas": 1, "two_gas": 2}.get(getattr(s, "gas_open", "one_gas"), 1)
+        bases = max(1, self.townhalls.amount)
+        if self._proxying:
             return dict(
                 worker_cap=16, gas_target=0, rax_cap=0, want_factory=False,
                 want_starport=False, want_ebay=False, want_turrets=False,
                 techlab_cap=0, attack_min_bio=4, retreat_bio=0,
                 medivac_cap=0, tank_cap=0, marauder=False, want_bunker=False,
             )
-        if build == "three_rax":
-            transitioned = t > 330
-            bases = max(1, self.townhalls.amount)
-            return dict(
-                worker_cap=(23 if not transitioned else min(60, 22 * bases)),
-                gas_target=(1 if t < 180 else 2),
-                rax_cap=(3 if not transitioned else 5),
-                want_factory=transitioned, want_starport=transitioned,
-                want_ebay=t > 360, want_turrets=(t > 400 or self.cloak_threat),
-                techlab_cap=1, attack_min_bio=14, retreat_bio=7,
-                medivac_cap=(2 if transitioned else 0), tank_cap=0, marauder=False,
-                want_bunker=self.enemy_rush_detected,
-            )
-        # bio_macro
-        bases = max(1, self.townhalls.amount)
-        if bases < 2:
-            rax_cap = 1
-        elif bases == 2:
-            rax_cap = 3
-        elif bases == 3:
-            rax_cap = 5
+        developed = bases >= 2 or t > 330
+        if not developed:
+            rax_cap = prod
+            worker_cap = 19 + 2 * prod
+            gas_target = gas0 if t < 150 else max(gas0, 1)
         else:
-            rax_cap = 8
+            rax_cap = min(9, 2 * bases + (1 if prod >= 3 else 0))
+            worker_cap = min(70, 22 * bases + 2)
+            gas_target = 2 if bases < 3 else 4
         return dict(
-            worker_cap=min(70, 22 * bases + 2),
-            gas_target=(1 if t < 210 else (2 if bases < 3 else 4)),
+            worker_cap=worker_cap,
+            gas_target=gas_target,
             rax_cap=rax_cap,
-            want_factory=(t > 240 and bases >= 2),
-            want_starport=(t > 270 and bases >= 2),
-            want_ebay=(t > 260 and bases >= 2),
+            want_factory=(developed and t > 240),
+            want_starport=(developed and t > 270),
+            want_ebay=(developed and t > 260) or t > 400,
             want_turrets=(t > 320 or self.cloak_threat),
             techlab_cap=(2 if bases >= 3 else 1),
-            attack_min_bio=22, retreat_bio=10,
-            medivac_cap=(2 if bases < 3 else 4),
+            attack_min_bio=6 + 5 * prod,
+            retreat_bio=3 + 2 * prod,
+            medivac_cap=((2 if bases < 3 else 4) if developed else 0),
             tank_cap=(2 if bases >= 2 else 0),
             marauder=True,
             want_bunker=self.enemy_rush_detected,
@@ -591,26 +586,26 @@ class BattencruiserBot(BotAI):
 
     def _wants_expand(self, cfg):
         t = self.time + (self.strategy.greed_expand_shift if self.strategy else 0)
-        build = self.active_build
         bases = self.townhalls.amount
-        if build == "proxy_2rax":
+        if self._proxying or self._base_threats:
             return False
-        if self._base_threats:
-            return False
-        if build == "three_rax":
-            if bases >= 3:
-                return self.minerals > 600 and t > 540
-            if bases == 2:
-                return t > 480
-            return (t > 220 and not self.enemy_rush_detected) or t > 300
-        # bio_macro
-        if self.enemy_rush_detected and t < 240:
-            return False
+        prod = {"1rax": 1, "2rax": 2, "3rax": 3}.get(getattr(self.strategy, "production", "2rax"), 2)
         if bases == 1:
-            return t > 100 and self.structures(UnitTypeId.BARRACKS).amount > 0
+            started = (
+                self.structures(UnitTypeId.BARRACKS).amount
+                + self.already_pending(UnitTypeId.BARRACKS)
+            )
+            if started < prod:
+                return False
+            base_time = 95 + 45 * (prod - 1)
+            if self.enemy_rush_detected:
+                base_time += 60
+            return t > base_time
         if bases == 2:
             return t > 330
-        return self.minerals > 500 and t > 480
+        if bases == 3:
+            return self.minerals > 500 and t > 480
+        return self.minerals > 600 and t > 540
 
     async def manage_expansion(self, cfg):
         if not self._wants_expand(cfg):
@@ -729,7 +724,7 @@ class BattencruiserBot(BotAI):
                         break
 
     async def manage_proxy(self):
-        if not self.strategy or self.strategy.build != "proxy_2rax" or self.time > 420:
+        if not self._proxying:
             return
         alive = self.workers.tags
         self.proxy_scv_tags = [tag for tag in self.proxy_scv_tags if tag in alive]
@@ -746,7 +741,8 @@ class BattencruiserBot(BotAI):
 
         proxy_scvs = self.workers.tags_in(self.proxy_scv_tags)
         rax_total = self.structures(UnitTypeId.BARRACKS).amount + self.already_pending(UnitTypeId.BARRACKS)
-        rax_cap = 2 if self.minerals < 400 else 3
+        base_rax = max(2, {"1rax": 1, "2rax": 2, "3rax": 3}.get(getattr(self.strategy, "production", "2rax"), 2))
+        rax_cap = base_rax if self.minerals < 400 else base_rax + 1
         if rax_total < rax_cap and self.can_afford(UnitTypeId.BARRACKS):
             for worker in proxy_scvs:
                 if worker.distance_to(self.proxy_point) < 12 and not worker.is_constructing_scv:
@@ -1176,7 +1172,7 @@ class BattencruiserBot(BotAI):
                 not self.attack_mode
                 and t > self._retreat_until
                 and bio.amount >= cfg["attack_min_bio"] * (1 + 0.15 * min(3, self._retreat_count))
-                and (self._stim_ready or t > 380 or (build == "three_rax" and t > 320))
+                and (self._stim_ready or t > 380 or (getattr(self.strategy, "production", "") == "3rax" and t > 320))
             ):
                 self.attack_mode = True
             if self.attack_mode and bio.amount <= cfg["retreat_bio"]:

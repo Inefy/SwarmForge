@@ -1,17 +1,11 @@
 """
-Open-ended per-opponent learning for Protodd, persisted via ./data.
+Generative strategy learning for Protodd (v5).
 
-Instead of one build bandit, FOUR independent learned dimensions combine into
-~135 possible ways to play, explored axis by axis:
-  * opening    - how the first minutes are spent
-  * aggression - how big an army before attacking (0.55x .. 1.7x)
-  * greed      - economy vs army: worker counts + expansion timing
-  * tech       - which unit composition to lean into
-
-Each arm is scored 65% by results vs THIS opponent, 35% by global results vs
-everyone, plus a small exploration bonus so the bot never stops experimenting.
-Opponent fingerprints (rushes, cloak, air, pressure timing) pre-adapt the next
-game, and every game is appended to data/games_protodd.jsonl for analysis.
+There are no named builds anymore. The bot composes its own way to play each
+game from independent learned dimensions - opening structure, gas timing,
+aggression size, economic greed, tech focus - giving hundreds of possible
+playstyles explored axis by axis. Arms are scored 65% vs this opponent and
+35% globally, with exploration noise so it never stops inventing.
 """
 
 import json
@@ -20,57 +14,53 @@ import random
 import tempfile
 import time
 
-OPENINGS = ['four_gate', 'stalker_immortal', 'proxy_gates']
-BUILDS = OPENINGS  # alias used by run.py --build forcing
-RACE_PRIORITY = {'Zerg': ['four_gate', 'stalker_immortal', 'proxy_gates'], 'Terran': ['stalker_immortal', 'four_gate', 'proxy_gates'], 'Protoss': ['four_gate', 'stalker_immortal', 'proxy_gates'], 'Random': ['four_gate', 'stalker_immortal', 'proxy_gates']}
-RUSH_UNSAFE_OPENING = 'proxy_gates'
+DIMS = {'gates_open': ['gate2', 'gate1', 'gate4'], 'location': ['home', 'proxy'], 'gas_open': ['one_gas', 'no_gas', 'two_gas'], 'aggression': ['standard', 'early', 'very_early', 'late', 'very_late'], 'greed': ['standard', 'greedy', 'lean'], 'tech': ['blink_stalker', 'immortal_core', 'chargelot']}
 
-AGGRESSION_ARMS = [
-    ("standard", 1.0), ("early", 0.75), ("very_early", 0.55),
-    ("late", 1.3), ("very_late", 1.7),
-]
-# (name, worker cap multiplier, expansion clock shift in seconds)
-GREED_ARMS = [("standard", 1.0, 0), ("greedy", 1.15, 50), ("lean", 0.85, -60)]
-TECH_ARMS = ['blink_stalker', 'immortal_core', 'chargelot']
-
+AGGRESSION_MULTS = {"standard": 1.0, "early": 0.75, "very_early": 0.55, "late": 1.3, "very_late": 1.7}
+GREED_PARAMS = {"standard": (1.0, 0), "greedy": (1.15, 50), "lean": (0.85, -60)}
+RUSH_UNSAFE = {'location': 'proxy'}
+OPENING_MIGRATION = {'four_gate': {'gates_open': 'gate4', 'location': 'home'}, 'stalker_immortal': {'gates_open': 'gate1', 'location': 'home'}, 'proxy_gates': {'gates_open': 'gate2', 'location': 'proxy'}}
 PROFILE_FLAGS = ["rushed", "worker_rush", "cannon_rush", "cloak", "air"]
 
 DATA_DIR = "data"
 DATA_FILE = os.path.join(DATA_DIR, "strategies_protodd.json")
 GAME_LOG = os.path.join(DATA_DIR, "games_protodd.jsonl")
 GLOBAL_KEY = "__global__"
-EXPLORATION = 0.10
+EXPLORATION = 0.10   # noise on scores (tie-breaking / soft exploration)
+EPSILON = 0.12       # chance per dimension to try a fully random arm
 
 
 def _laplace(wl):
-    wins, losses = wl[0], wl[1]
-    return (wins + 1.0) / (wins + losses + 2.0)
+    return (wl[0] + 1.0) / (wl[0] + wl[1] + 2.0)
 
 
 class StrategyManager:
     def __init__(self, opponent_id, enemy_race_name="Random"):
         self.opponent_id = str(opponent_id) if opponent_id else "unknown"
         self.enemy_race_name = enemy_race_name
-        self.priority = RACE_PRIORITY.get(enemy_race_name, RACE_PRIORITY["Random"])
         self.all_data = self._load()
         self.record = self._migrate(self.all_data.get(self.opponent_id, {}))
         self.global_record = self._migrate(self.all_data.get(GLOBAL_KEY, {}))
         self.profile = self.record.get("profile", {})
         self.observed = {}
 
-        self.build = self._choose("opening", self._opening_candidates())
+        self.choices = {}
+        risky = self.expects("worker_rush") or self.expects("rushed")
+        for dim, arms in DIMS.items():
+            candidates = list(arms)
+            if risky and dim in RUSH_UNSAFE and len(candidates) > 1:
+                trimmed = [a for a in candidates if a != RUSH_UNSAFE[dim]]
+                if trimmed:
+                    candidates = trimmed
+            self.choices[dim] = self._choose(dim, candidates)
+            setattr(self, dim, self.choices[dim])
+        self.aggression_mult = AGGRESSION_MULTS.get(self.choices.get("aggression"), 1.0)
+        greed = GREED_PARAMS.get(self.choices.get("greed"), (1.0, 0))
+        self.greed_worker_mult, self.greed_expand_shift = greed
+        # Human-readable label for logs.
+        self.build = "/".join(self.choices[d] for d in DIMS)
         self.opening = self.build
-        aggr = self._choose("aggression", [a[0] for a in AGGRESSION_ARMS])
-        self.aggression = aggr
-        self.aggression_mult = dict((n, m) for n, m in AGGRESSION_ARMS)[aggr]
-        greed = self._choose("greed", [g[0] for g in GREED_ARMS])
-        self.greed = greed
-        greed_info = dict((n, (m, s)) for n, m, s in GREED_ARMS)[greed]
-        self.greed_worker_mult, self.greed_expand_shift = greed_info
-        self.tech = self._choose("tech", list(TECH_ARMS))
         self.reported = False
-
-    # ---------------------------------------------------------------- storage
 
     @staticmethod
     def _load():
@@ -85,18 +75,25 @@ class StrategyManager:
 
     @staticmethod
     def _migrate(record):
-        """Upgrade v3 records (builds/aggr) to the v4 dims schema in place."""
+        """v3 builds/aggr -> v4 dims -> v5 seeded generative dims."""
         try:
             dims = record.setdefault("dims", {})
             if "builds" in record and "opening" not in dims:
                 dims["opening"] = record["builds"]
             if "aggr" in record and "aggression" not in dims:
                 dims["aggression"] = record["aggr"]
+            record.pop("builds", None)
+            record.pop("aggr", None)
+            old_openings = dims.pop("opening", None)
+            if old_openings:
+                for old_arm, wl in old_openings.items():
+                    for dim, arm in OPENING_MIGRATION.get(old_arm, {}).items():
+                        slot = dims.setdefault(dim, {}).setdefault(arm, [0, 0])
+                        slot[0] += wl[0]
+                        slot[1] += wl[1]
         except Exception:
             pass
         return record
-
-    # --------------------------------------------------------------- profile
 
     def expects(self, flag, threshold=0.4):
         try:
@@ -123,46 +120,31 @@ class StrategyManager:
         except Exception:
             pass
 
-    # --------------------------------------------------------------- choosing
-
-    def _opening_candidates(self):
-        candidates = list(self.priority)
-        if (
-            RUSH_UNSAFE_OPENING
-            and (self.expects("worker_rush") or self.expects("rushed"))
-            and len(candidates) > 1
-        ):
-            candidates = [c for c in candidates if c != RUSH_UNSAFE_OPENING] or candidates
-        return candidates
-
     def _choose(self, dim, candidates):
+        # Guaranteed exploration: never stop testing alternatives.
+        if random.random() < EPSILON:
+            return random.choice(candidates)
         opp = self.record.get("dims", {}).get(dim, {})
         glob = self.global_record.get("dims", {}).get(dim, {})
 
         def score(item):
             index, name = item
             s = 0.65 * _laplace(opp.get(name, [0, 0])) + 0.35 * _laplace(glob.get(name, [0, 0]))
-            s += random.uniform(0.0, EXPLORATION)     # keep experimenting
-            s += (len(candidates) - index) * 0.005    # tiny order bias for game 1
+            s += random.uniform(0.0, EXPLORATION)
+            s += (len(candidates) - index) * 0.005
             return s
 
         _, best = max(enumerate(candidates), key=score)
         return best
-
-    # -------------------------------------------------------------- reporting
 
     def report(self, won, stats=None):
         if self.reported:
             return
         self.reported = True
         try:
-            picks = {
-                "opening": self.opening, "aggression": self.aggression,
-                "greed": self.greed, "tech": self.tech,
-            }
             for record in (self.record, self.global_record):
                 dims = record.setdefault("dims", {})
-                for dim, arm in picks.items():
+                for dim, arm in self.choices.items():
                     wl = dims.setdefault(dim, {}).setdefault(arm, [0, 0])
                     wl[0 if won else 1] += 1
                 record["games"] = int(record.get("games", 0)) + 1
@@ -183,11 +165,11 @@ class StrategyManager:
             self.all_data[self.opponent_id] = self.record
             self.all_data[GLOBAL_KEY] = self.global_record
             self._save()
-            self._log_game(won, picks, stats)
+            self._log_game(won, stats)
         except Exception:
             pass
 
-    def _log_game(self, won, picks, stats):
+    def _log_game(self, won, stats):
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
             entry = {
@@ -196,7 +178,7 @@ class StrategyManager:
                 "enemy_race": self.enemy_race_name,
                 "won": bool(won),
             }
-            entry.update(picks)
+            entry.update(self.choices)
             if stats:
                 entry["stats"] = stats
             if self.observed:

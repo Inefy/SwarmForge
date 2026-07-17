@@ -16,13 +16,15 @@ bandit, threat fingerprinting with pre-adaptation), fight-or-flee combat
 evaluation, effect/baneling dodging, range-aware stutter micro, and splash
 spreading. See each bot folder's README/source for details.
 
-## What the bots learn (v4)
+## What the bots learn (v5 - generative openings)
 
 Four independent dimensions are learned per opponent (~135 combinations),
 each scored 65% vs that opponent / 35% globally, with exploration noise so
 the bots keep experimenting instead of locking into one build:
 
-* **opening** - how the first minutes are spent
+* **opening structure** - composed from parameters, not scripts: production
+  count (1/2/3 rax, 1/2/4 gates, pool at 12/16/hatch-first), home vs proxy
+  location, and gas timing - hundreds of emergent openings per bot
 * **aggression** - attack at 0.55x to 1.7x the normal army size
 * **greed** - worker counts and expansion timing (lean / standard / greedy)
 * **tech** - composition focus (e.g. marauder_bio, ling_flood, chargelot)

@@ -156,15 +156,21 @@ class ProtoddBot(BotAI):
         self.proxy_point = center.towards(enemy_start, center.distance_to(enemy_start) * 0.45)
 
     @property
+    def _proxying(self):
+        return (
+            bool(self.strategy)
+            and getattr(self.strategy, "location", "home") == "proxy"
+            and self.time < 420
+        )
+
+    @property
     def active_build(self):
-        build = self.strategy.build if self.strategy else "four_gate"
-        if build == "proxy_gates" and self.time > 420:
-            return "four_gate"
-        return build
+        # Synthetic label: openings are now composed from learned parameters.
+        return "proxy_gates" if self._proxying else "macro"
 
     @property
     def all_in(self):
-        return self.active_build == "proxy_gates" or self.supply_used > 190 or not self.townhalls
+        return self._proxying or self.supply_used > 190 or not self.townhalls
 
     def _army_supply_est(self):
         return (
@@ -175,41 +181,39 @@ class ProtoddBot(BotAI):
 
     def _base_build_config(self):
         t = self.time
-        build = self.active_build
+        s = self.strategy
+        gates0 = {"gate1": 1, "gate2": 2, "gate4": 4}.get(getattr(s, "gates_open", "gate2"), 2)
+        gas0 = {"no_gas": 0, "one_gas": 1, "two_gas": 2}.get(getattr(s, "gas_open", "one_gas"), 1)
         bases = max(1, self.townhalls.amount)
-        if build == "proxy_gates":
+        if self._proxying:
             return dict(
                 probe_cap=17, gas_target=0, gate_cap=0,
                 want_robo=False, want_twilight=False, want_forge=False,
                 immortal_cap=0, observer_cap=0,
                 attack_min=6, retreat_at=0,
             )
-        if build == "four_gate":
-            transitioned = t > 390
-            return dict(
-                probe_cap=(23 if not transitioned else min(66, 22 * bases)),
-                gas_target=(1 if t < 145 else 2),
-                gate_cap=(1 if t < 100 else 4) if not transitioned else 5,
-                want_robo=transitioned, want_twilight=transitioned, want_forge=t > 420,
-                immortal_cap=(2 if transitioned else 0), observer_cap=(1 if transitioned else 0),
-                attack_min=16, retreat_at=6,
-            )
-        # stalker_immortal
-        if bases < 2:
-            gate_cap = 1
-        elif bases == 2:
-            gate_cap = 3
+        developed = bases >= 2 or t > 390
+        if not developed:
+            gate_cap = 1 if t < 100 else gates0
+            probe_cap = 21 + gates0
+            if gates0 >= 4 and t > 140:
+                gas_target = max(gas0, 2)
+            else:
+                gas_target = gas0 if t < 145 else max(gas0, 1)
         else:
-            gate_cap = 6
+            gate_cap = 3 if bases == 2 else 6
+            probe_cap = min(66, 22 * bases)
+            gas_target = min(2 * bases, 6)
+        attack_min = {1: 40, 2: 26, 4: 16}.get(gates0, 26)
         return dict(
-            probe_cap=min(66, 22 * bases),
-            gas_target=(1 if t < 150 else min(2 * bases, 6)),
-            gate_cap=gate_cap,
-            want_robo=(t > 210 and bases >= 2),
-            want_twilight=t > 300,
-            want_forge=t > 320,
-            immortal_cap=4, observer_cap=(2 if self.cloak_threat else 1),
-            attack_min=42, retreat_at=18,
+            probe_cap=probe_cap, gas_target=gas_target, gate_cap=gate_cap,
+            want_robo=(developed and t > 210),
+            want_twilight=(developed and t > 300),
+            want_forge=(developed and t > 320),
+            immortal_cap=(4 if developed else 0),
+            observer_cap=((2 if self.cloak_threat else 1) if developed else 0),
+            attack_min=attack_min,
+            retreat_at=max(4, attack_min * 2 // 5),
         )
 
     def build_config(self):
@@ -488,16 +492,15 @@ class ProtoddBot(BotAI):
 
     def _wants_expand(self):
         t = self.time + (self.strategy.greed_expand_shift if self.strategy else 0)
-        build = self.active_build
         bases = self.townhalls.amount
-        if build == "proxy_gates" or self._base_threats:
+        if self._proxying or self._base_threats:
             return False
-        if build == "four_gate":
-            if bases == 1:
-                return t > 390
-            return self.minerals > 500 and t > 520
+        gates_arm = getattr(self.strategy, "gates_open", "gate2") if self.strategy else "gate2"
         if bases == 1:
-            return t > 155 and not (self.enemy_rush_detected and t < 240)
+            first = {"gate1": 155, "gate2": 240, "gate4": 390}.get(gates_arm, 240)
+            if self.enemy_rush_detected:
+                first = max(first, 240)
+            return t > first
         if bases == 2:
             return t > 390
         return self.minerals > 500 and t > 540
@@ -596,10 +599,13 @@ class ProtoddBot(BotAI):
                         await self._build_near(UnitTypeId.SHIELDBATTERY, self.natural_position.towards(self.game_info.map_center, 3), step=2)
 
     async def manage_proxy(self, cfg):
-        build = self.strategy.build if self.strategy else ""
         t = self.time
-        # four_gate proxy pylon for forward warp-ins.
-        if self.active_build == "four_gate" and 200 < t < 400:
+        # Forward pylon for warp-ins on gate-heavy home openings.
+        if (
+            not self._proxying
+            and getattr(self.strategy, "gates_open", "") == "gate4"
+            and 200 < t < 400
+        ):
             proxy_pylons = self.structures(UnitTypeId.PYLON).filter(
                 lambda p: p.distance_to(self.proxy_point) < 20
             )
@@ -611,7 +617,7 @@ class ProtoddBot(BotAI):
                         worker.build(UnitTypeId.PYLON, location)
             return
 
-        if build != "proxy_gates" or t > 420:
+        if not self._proxying:
             return
         alive = self.workers.tags
         self.proxy_scv_tags = [tag for tag in self.proxy_scv_tags if tag in alive]

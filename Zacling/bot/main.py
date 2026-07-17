@@ -151,15 +151,21 @@ class ZaclingBot(BotAI):
         self.overlord_park = self.start_location.towards(self.game_info.map_center, -6)
 
     @property
+    def _rushing(self):
+        return (
+            bool(self.strategy)
+            and getattr(self.strategy, "pool_timing", "pool16") == "pool12"
+            and self.time < 300
+        )
+
+    @property
     def active_build(self):
-        build = self.strategy.build if self.strategy else "roach_timing"
-        if build == "twelve_pool" and self.time > 300:
-            return "roach_timing"
-        return build
+        # Synthetic label: openings are now composed from learned parameters.
+        return "twelve_pool" if self._rushing else "macro"
 
     @property
     def all_in(self):
-        return self.active_build == "twelve_pool" or self.supply_used > 190 or not self.townhalls
+        return self._rushing or self.supply_used > 190 or not self.townhalls
 
     def _army_supply_est(self):
         return (
@@ -170,39 +176,36 @@ class ZaclingBot(BotAI):
 
     def _base_build_config(self):
         t = self.time
-        build = self.active_build
+        s = self.strategy
+        gas0 = {"no_gas": 0, "one_gas": 1, "two_gas": 2}.get(getattr(s, "gas_open", "one_gas"), 1)
         bases = max(1, self.townhalls.amount)
-        if build == "twelve_pool":
+        if self._rushing:
             return dict(
                 drone_cap=14, gas_target=1, queen_cap=1,
                 want_warren=False, want_lair=False, want_den=False,
                 evo_count=0, want_spines=False,
                 attack_min=2, retreat_at=0, ling_only=True,
             )
-        if build == "roach_timing":
-            transitioned = t > 330
-            return dict(
-                drone_cap=(30 if not transitioned else min(66, 20 * bases)),
-                gas_target=(1 if t < 160 else 2),
-                queen_cap=min(4, bases + 1),
-                want_warren=t > 130,
-                want_lair=transitioned,
-                want_den=t > 380,
-                evo_count=(1 if t > 330 else 0),
-                want_spines=self.enemy_rush_detected,
-                attack_min=26, retreat_at=12, ling_only=False,
-            )
-        # macro_hydra
+        developed = bases >= 2 or t > 330
+        if not developed:
+            drone_cap = 30
+            gas_target = gas0 if t < 160 else max(gas0, 1)
+        else:
+            drone_cap = min(70, 20 * bases + 4)
+            gas_target = 2 if bases < 3 else 4
+        evo_count = 0
+        if t > 330:
+            evo_count = 2 if bases >= 3 else 1
         return dict(
-            drone_cap=min(70, 20 * bases + 4),
-            gas_target=(2 if t < 270 else 4),
+            drone_cap=drone_cap,
+            gas_target=gas_target,
             queen_cap=min(5, bases + 1),
-            want_warren=t > 170,
-            want_lair=t > 250,
-            want_den=True,
-            evo_count=(2 if t > 300 else 0),
+            want_warren=t > 130,
+            want_lair=(developed and t > 250),
+            want_den=t > 380,
+            evo_count=evo_count,
             want_spines=self.enemy_rush_detected,
-            attack_min=55, retreat_at=24, ling_only=False,
+            attack_min=26, retreat_at=12, ling_only=False,
         )
 
     def build_config(self):
@@ -503,21 +506,19 @@ class ZaclingBot(BotAI):
 
     def _wants_expand(self):
         t = self.time + (self.strategy.greed_expand_shift if self.strategy else 0)
-        build = self.active_build
         bases = self.townhalls.amount
-        if self._base_threats:
+        if self._rushing or self._base_threats:
             return False
-        if build == "twelve_pool":
-            return False
+        arm = getattr(self.strategy, "pool_timing", "pool16") if self.strategy else "pool16"
         pool_started = bool(self.structures(UnitTypeId.SPAWNINGPOOL)) or self.already_pending(UnitTypeId.SPAWNINGPOOL)
         if bases == 1:
+            if arm == "hatch_first":
+                return t > 55
+            if arm == "pool12":
+                return t > 270
             return t > 95 and pool_started
-        if build == "roach_timing":
-            if bases == 2:
-                return t > 330
-            return self.minerals > 500 and t > 480
         if bases == 2:
-            return t > 250
+            return t > 280
         if bases == 3:
             return t > 430
         return self.minerals > 500 and t > 540
@@ -556,7 +557,19 @@ class ZaclingBot(BotAI):
         # Spawning pool: immediately for twelve_pool, ~16 supply otherwise.
         pool_count = self.structures(UnitTypeId.SPAWNINGPOOL).amount + self.already_pending(UnitTypeId.SPAWNINGPOOL)
         if pool_count == 0 and self.can_afford(UnitTypeId.SPAWNINGPOOL):
-            if self.active_build == "twelve_pool" or self.supply_workers >= 15 or t > 90:
+            arm = getattr(self.strategy, "pool_timing", "pool16") if self.strategy else "pool16"
+            if (
+                arm == "pool12"
+                or (arm == "pool16" and (self.supply_workers >= 15 or t > 90))
+                or (
+                    arm == "hatch_first"
+                    and (
+                        self.townhalls.amount >= 2
+                        or self.already_pending(UnitTypeId.HATCHERY)
+                        or t > 120
+                    )
+                )
+            ):
                 await self._build_near(UnitTypeId.SPAWNINGPOOL, near)
 
         pool_ready = bool(self.structures(UnitTypeId.SPAWNINGPOOL).ready)
