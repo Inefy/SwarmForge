@@ -110,6 +110,7 @@ class BattencruiserBot(BotAI):
     RACE_NAME = "Terran"
 
     def __init__(self):
+        self.raw_affects_selection = True
         self.strategy = None
         self.attack_mode = False
         self.scv_pulled_for_allin = False
@@ -143,6 +144,8 @@ class BattencruiserBot(BotAI):
         self._first_pressure_recorded = False
         self._cached_bio_for_spread = None
         self._point_order_cache = {}
+        self._special_last_cast = {}
+        self._reported_errors = set()
         self._stats = {}
         self._retreat_count = 0
         self._tank_last_enemy = {}
@@ -175,6 +178,13 @@ class BattencruiserBot(BotAI):
             if self.strategy:
                 if self.strategy.expects("rushed") or self.strategy.expects("worker_rush"):
                     self.enemy_rush_detected = True  # bunker up, hold the wall, delay expand
+                try:
+                    fp = float(self.strategy.profile.get("first_pressure_ewma", 9999))
+                    samples = int(self.strategy.profile.get("pressure_samples", 0))
+                    if samples >= 3 and fp < 360:
+                        self.enemy_rush_detected = True  # their pressure comes early
+                except Exception:
+                    pass
                 if self.strategy.expects("cloak"):
                     self.cloak_threat = True  # ebay + turrets + scan energy early
                 if self.strategy.expects("air"):
@@ -331,9 +341,9 @@ class BattencruiserBot(BotAI):
     async def on_step(self, iteration: int):
         try:
             await self._step(iteration)
-        except Exception:
+        except Exception as exc:
             # Never crash out of a ladder game.
-            pass
+            self._report_error("on_step", exc)
 
     async def _step(self, iteration: int):
         if not self.greeted and iteration >= 2:
@@ -347,7 +357,11 @@ class BattencruiserBot(BotAI):
         if iteration % 64 == 0 and iteration > 0:
             try:
                 avg_ms = self.step_time[1]
-                if avg_ms > 66 and self.client.game_step < 4:
+                if self.supply_used > 170:
+                    self.client.game_step = 6
+                elif self.supply_used > 110:
+                    self.client.game_step = 4
+                elif avg_ms > 66 and self.client.game_step < 4:
                     self.client.game_step = 4
                 elif avg_ms < 25 and self.client.game_step > 2:
                     self.client.game_step = 2
@@ -375,7 +389,8 @@ class BattencruiserBot(BotAI):
         await self._safe(self.train_army(cfg))
         await self._safe(self.manage_scout())
         await self._safe(self.manage_defense())
-        await self._safe(self.control_army(cfg))
+        if iteration % 2 == 0:
+            await self._safe(self.control_army(cfg))
         await self._safe(self.manage_depot_wall())
 
         if iteration % 16 == 0:
@@ -385,8 +400,16 @@ class BattencruiserBot(BotAI):
     async def _safe(self, coro):
         try:
             await coro
-        except Exception:
-            pass
+        except Exception as exc:
+            name = getattr(getattr(coro, "cr_code", None), "co_name", "task")
+            self._report_error(name, exc)
+
+    def _report_error(self, context, exc):
+        key = (context, type(exc).__name__, str(exc))
+        if key in self._reported_errors:
+            return
+        self._reported_errors.add(key)
+        print("[%s] %s failed: %s: %s" % (self.NAME, context, type(exc).__name__, exc), flush=True)
 
     async def on_end(self, game_result):
         try:
@@ -632,6 +655,9 @@ class BattencruiserBot(BotAI):
         bases = self.townhalls.amount
         if self._proxying or self._base_threats:
             return False
+        # Failed pushes: stop banging heads, take a base and grow instead.
+        if self._retreat_count >= 2 and bases == 1 and t > 240:
+            return True
         prod = {"1rax": 1, "2rax": 2, "3rax": 3}.get(getattr(self.strategy, "production", "2rax"), 2)
         if bases == 1:
             started = (
@@ -902,6 +928,43 @@ class BattencruiserBot(BotAI):
                     ebay.research(upgrade)
                     break
 
+        army_plan = getattr(self.strategy, "army", "mixed") if self.strategy else "mixed"
+        armory_upgrades = []
+        if army_plan in {"mech", "mixed"}:
+            armory_upgrades.extend([
+                UpgradeId.TERRANVEHICLEWEAPONSLEVEL1,
+                UpgradeId.TERRANVEHICLEWEAPONSLEVEL2,
+                UpgradeId.TERRANVEHICLEWEAPONSLEVEL3,
+            ])
+        if army_plan in {"sky", "mixed"}:
+            armory_upgrades.extend([
+                UpgradeId.TERRANSHIPWEAPONSLEVEL1,
+                UpgradeId.TERRANSHIPWEAPONSLEVEL2,
+                UpgradeId.TERRANSHIPWEAPONSLEVEL3,
+            ])
+        armory_upgrades.extend([
+            UpgradeId.TERRANVEHICLEANDSHIPARMORSLEVEL1,
+            UpgradeId.TERRANVEHICLEANDSHIPARMORSLEVEL2,
+            UpgradeId.TERRANVEHICLEANDSHIPARMORSLEVEL3,
+        ])
+        for armory in self.structures(UnitTypeId.ARMORY).ready.idle:
+            for upgrade in armory_upgrades:
+                if self.already_pending_upgrade(upgrade) == 0 and self.can_afford(upgrade):
+                    armory.research(upgrade)
+                    break
+
+        starport_upgrades = [UpgradeId.RAVENCORVIDREACTOR, UpgradeId.BANSHEECLOAK]
+        for techlab in self.structures(UnitTypeId.STARPORTTECHLAB).ready.idle:
+            for upgrade in starport_upgrades:
+                if self.already_pending_upgrade(upgrade) == 0 and self.can_afford(upgrade):
+                    techlab.research(upgrade)
+                    break
+
+        for core in self.structures(UnitTypeId.FUSIONCORE).ready.idle:
+            upgrade = UpgradeId.BATTLECRUISERENABLESPECIALIZATIONS
+            if self.already_pending_upgrade(upgrade) == 0 and self.can_afford(upgrade):
+                core.research(upgrade)
+
     async def train_army(self, cfg):
         reactor_tags = self.structures(UnitTypeId.BARRACKSREACTOR).tags
         techlab_tags = self.structures(UnitTypeId.BARRACKSTECHLAB).tags
@@ -925,7 +988,11 @@ class BattencruiserBot(BotAI):
             can_queue = port.is_idle or (port.add_on_tag in port_reactor_tags and len(port.orders) < 2)
             if not can_queue:
                 continue
-            if (
+            if vikings_have < viking_target and self.can_afford(UnitTypeId.VIKINGFIGHTER):
+                # Do not let luxury tech delay the hard anti-air response.
+                port.train(UnitTypeId.VIKINGFIGHTER)
+                vikings_have += 1
+            elif (
                 port.add_on_tag in port_techlab_tags
                 and self.structures(UnitTypeId.FUSIONCORE).ready
                 and battlecruisers < max(1, self.townhalls.amount // 2)
@@ -940,9 +1007,6 @@ class BattencruiserBot(BotAI):
             elif port.add_on_tag in port_techlab_tags and banshees <= liberators and self.can_afford(UnitTypeId.BANSHEE):
                 port.train(UnitTypeId.BANSHEE)
                 banshees += 1
-            elif vikings_have < viking_target and self.can_afford(UnitTypeId.VIKINGFIGHTER):
-                port.train(UnitTypeId.VIKINGFIGHTER)
-                vikings_have += 1
             elif cfg["medivac_cap"] > 0 and medivacs_have < cfg["medivac_cap"] and self.can_afford(UnitTypeId.MEDIVAC):
                 port.train(UnitTypeId.MEDIVAC)
                 medivacs_have += 1
@@ -1343,6 +1407,8 @@ class BattencruiserBot(BotAI):
                 self._micro_tank(unit, target, bio_center)
             elif unit.type_id in VIKING_TYPES:
                 self._micro_viking(unit, target, bio_center)
+            elif self._micro_special(unit, target, bio_center):
+                continue
             else:
                 self._micro_bio(unit, target, aggressive=self.attack_mode or defending)
 
@@ -1400,6 +1466,159 @@ class BattencruiserBot(BotAI):
         if victim.is_flying:
             return threat.air_range
         return threat.ground_range
+
+    def _can_cast_again(self, unit, ability, cooldown):
+        key = (unit.tag, ability)
+        if self.time - self._special_last_cast.get(key, -999.0) < cooldown:
+            return False
+        self._special_last_cast[key] = self.time
+        return True
+
+    @staticmethod
+    def _cluster_anchor(enemies, radius, minimum):
+        best = None
+        best_count = minimum - 1
+        for enemy in enemies:
+            count = enemies.closer_than(radius, enemy).amount
+            if count > best_count:
+                best = enemy
+                best_count = count
+        return best
+
+    def _micro_special(self, unit, target_point, army_center):
+        """Use high-impact specialist abilities before falling back to weapon micro."""
+        enemies = self._cached_enemies
+
+        if unit.type_id == UnitTypeId.GHOST:
+            if self._dodge(unit):
+                return True
+            local = enemies.closer_than(10, unit)
+            shielded = local.filter(lambda e: e.shield >= 25)
+            emp_target = self._cluster_anchor(shielded, 3.0, 2)
+            if (
+                unit.energy >= 75
+                and emp_target is not None
+                and self._can_cast_again(unit, AbilityId.EMP_EMP, 2.5)
+            ):
+                unit(AbilityId.EMP_EMP, emp_target.position)
+                return True
+            biological = local.filter(lambda e: e.is_biological and e.health >= 80)
+            if (
+                unit.energy >= 50
+                and biological
+                and self._can_cast_again(unit, AbilityId.EFFECT_GHOSTSNIPE, 2.0)
+            ):
+                unit(AbilityId.EFFECT_GHOSTSNIPE, max(biological, key=lambda e: e.health))
+                return True
+            return False
+
+        if unit.type_id == UnitTypeId.RAVEN:
+            if self._dodge(unit):
+                return True
+            local = enemies.closer_than(11, unit)
+            armor_target = self._cluster_anchor(local, 3.0, 3)
+            if (
+                unit.energy >= 75
+                and armor_target is not None
+                and self._can_cast_again(unit, AbilityId.EFFECT_ANTIARMORMISSILE, 5.0)
+            ):
+                unit(AbilityId.EFFECT_ANTIARMORMISSILE, armor_target)
+                return True
+            mechanical = local.filter(lambda e: e.is_mechanical and (e.health + e.shield) >= 125)
+            if (
+                unit.energy >= 75
+                and mechanical
+                and self._can_cast_again(unit, AbilityId.EFFECT_INTERFERENCEMATRIX, 4.0)
+            ):
+                unit(AbilityId.EFFECT_INTERFERENCEMATRIX, max(mechanical, key=lambda e: e.health + e.shield))
+                return True
+            escort = army_center or self.staging_point
+            if unit.distance_to(escort) > 7:
+                unit.move(escort)
+            return True
+
+        if unit.type_id == UnitTypeId.BATTLECRUISER:
+            local = enemies.closer_than(10, unit)
+            if (
+                unit.energy >= 100
+                and local
+                and self._can_cast_again(unit, AbilityId.YAMATO_YAMATOGUN, 6.0)
+            ):
+                unit(AbilityId.YAMATO_YAMATOGUN, max(local, key=lambda e: e.health + e.shield))
+                return True
+            return False
+
+        if unit.type_id == UnitTypeId.CYCLONE:
+            local = enemies.closer_than(7, unit).filter(lambda e: e.is_armored or e.is_flying)
+            if local and self._can_cast_again(unit, AbilityId.LOCKON_LOCKON, 5.0):
+                unit(AbilityId.LOCKON_LOCKON, max(local, key=lambda e: e.health + e.shield))
+                return True
+            return False
+
+        if unit.type_id == UnitTypeId.WIDOWMINE:
+            ground = enemies.not_flying.closer_than(7, unit)
+            if ground.amount >= 2 and self._can_cast_again(unit, AbilityId.BURROWDOWN_WIDOWMINE, 2.0):
+                unit(AbilityId.BURROWDOWN_WIDOWMINE)
+                return True
+            return False
+
+        if unit.type_id == UnitTypeId.WIDOWMINEBURROWED:
+            if (
+                not enemies.closer_than(11, unit)
+                and unit.distance_to(target_point) > 12
+                and self._can_cast_again(unit, AbilityId.BURROWUP_WIDOWMINE, 3.0)
+            ):
+                unit(AbilityId.BURROWUP_WIDOWMINE)
+            return True
+
+        if unit.type_id == UnitTypeId.LIBERATOR:
+            ground = enemies.not_flying.closer_than(10, unit)
+            anchor = self._cluster_anchor(ground, 3.0, 3)
+            if anchor is not None and self._can_cast_again(unit, AbilityId.MORPH_LIBERATORAGMODE, 5.0):
+                unit(AbilityId.MORPH_LIBERATORAGMODE, anchor.position)
+                return True
+            return False
+
+        if unit.type_id == UnitTypeId.LIBERATORAG:
+            if (
+                not enemies.not_flying.closer_than(13, unit)
+                and unit.distance_to(target_point) > 15
+                and self._can_cast_again(unit, AbilityId.MORPH_LIBERATORAAMODE, 5.0)
+            ):
+                unit(AbilityId.MORPH_LIBERATORAAMODE)
+            return True
+
+        if unit.type_id == UnitTypeId.HELLION:
+            light = enemies.not_flying.closer_than(5, unit).filter(lambda e: e.is_light)
+            if (
+                light.amount >= 3
+                and self.structures(UnitTypeId.ARMORY).ready
+                and self._can_cast_again(unit, AbilityId.MORPH_HELLBAT, 5.0)
+            ):
+                unit(AbilityId.MORPH_HELLBAT)
+                return True
+
+        if unit.type_id == UnitTypeId.BANSHEE:
+            anti_air = enemies.filter(lambda e: e.can_attack_air and e.distance_to(unit) < e.air_range + 2)
+            cloak_done = self.already_pending_upgrade(UpgradeId.BANSHEECLOAK) == 1
+            if (
+                cloak_done
+                and anti_air
+                and unit.energy >= 50
+                and not unit.has_buff(BuffId.BANSHEECLOAK)
+                and self._can_cast_again(unit, AbilityId.BEHAVIOR_CLOAKON_BANSHEE, 4.0)
+            ):
+                unit(AbilityId.BEHAVIOR_CLOAKON_BANSHEE)
+                return True
+            if (
+                unit.has_buff(BuffId.BANSHEECLOAK)
+                and not anti_air
+                and unit.energy < 25
+                and self._can_cast_again(unit, AbilityId.BEHAVIOR_CLOAKOFF_BANSHEE, 4.0)
+            ):
+                unit(AbilityId.BEHAVIOR_CLOAKOFF_BANSHEE)
+                return True
+        return False
 
     def _micro_bio(self, unit, target_point, aggressive):
         if self._dodge(unit):

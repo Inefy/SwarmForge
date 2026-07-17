@@ -40,7 +40,10 @@ def load_bot_class(name):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bot1", required=True, choices=sorted(BOTS))
-    parser.add_argument("--bot2", required=True, choices=sorted(BOTS))
+    opponent = parser.add_mutually_exclusive_group(required=True)
+    opponent.add_argument("--bot2", choices=sorted(BOTS))
+    opponent.add_argument("--computer-race", choices=["Terran", "Zerg", "Protoss", "Random"],
+                          help="Play vs the built-in non-cheating Very Hard AI")
     parser.add_argument("--map", required=True)
     parser.add_argument("--game-time-limit", type=int, default=10800,
                         help="Max game duration in in-game seconds (default 3 game-hours)")
@@ -50,23 +53,28 @@ def main():
     os.chdir(HERE)
 
     from sc2 import maps
-    from sc2.data import Race, Result
+    from sc2.data import Difficulty, Race, Result
     from sc2.main import run_game
-    from sc2.player import Bot
+    from sc2.player import Bot, Computer
 
     cls1 = load_bot_class(args.bot1)
-    cls2 = load_bot_class(args.bot2)
-    ai1, ai2 = cls1(), cls2()
-    # Stable opponent IDs so the per-opponent learning applies across the session.
-    ai1.opponent_id = "arena_" + args.bot2
-    ai2.opponent_id = "arena_" + args.bot1
+    ai1 = cls1()
+    if args.computer_race:
+        # Stable ID per AI race so learning vs the Elite AI accumulates too.
+        ai1.opponent_id = "ai_elite_" + args.computer_race.lower()
+        opponent = Computer(Race[args.computer_race], Difficulty.VeryHard)
+        opponent_name = "AI_" + args.computer_race
+    else:
+        cls2 = load_bot_class(args.bot2)
+        ai2 = cls2()
+        ai1.opponent_id = "arena_" + args.bot2
+        ai2.opponent_id = "arena_" + args.bot1
+        opponent = Bot(Race[BOTS[args.bot2]], ai2, name=args.bot2)
+        opponent_name = args.bot2
 
     result = run_game(
         maps.get(args.map),
-        [
-            Bot(Race[BOTS[args.bot1]], ai1, name=args.bot1),
-            Bot(Race[BOTS[args.bot2]], ai2, name=args.bot2),
-        ],
+        [Bot(Race[BOTS[args.bot1]], ai1, name=args.bot1), opponent],
         realtime=False,
         game_time_limit=args.game_time_limit,
     )
@@ -80,9 +88,10 @@ def main():
     if isinstance(result, list):
         r1, r2 = norm(result[0]), norm(result[1])
     else:
-        r1, r2 = norm(result), "Unknown"
+        r1 = norm(result)
+        r2 = {"Victory": "Defeat", "Defeat": "Victory", "Tie": "Tie"}.get(r1, "Unknown")
     print("RESULT_JSON " + json.dumps(
-        {"bot1": args.bot1, "bot2": args.bot2, "map": args.map, "result1": r1, "result2": r2}
+        {"bot1": args.bot1, "bot2": opponent_name, "map": args.map, "result1": r1, "result2": r2}
     ))
 
 

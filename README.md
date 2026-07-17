@@ -11,16 +11,18 @@ Three aiarena.net StarCraft II ladder bots sharing one adaptive architecture:
 | **Zacling** | Zerg | learned swarm, ranged, air, hive, and rush plans |
 | **Protodd** | Protoss | learned gateway, robotics, fleet, mixed, and proxy plans |
 
-Every bot has per-opponent persistent learning (build bandit, attack-timing
-bandit, threat fingerprinting with pre-adaptation), fight-or-flee combat
-evaluation, effect/baneling dodging, range-aware stutter micro, and splash
-spreading. See each bot folder's README/source for details.
+Every bot has confidence-aware per-opponent learning, threat fingerprinting
+with pre-adaptation, fight-or-flee combat evaluation, effect/baneling dodging,
+range-aware stutter micro, specialist spellcasting, reactive counter production,
+and complete ground/air/late-tech upgrade paths.
 
 ## What the bots learn (v5 - generative openings)
 
 Independent dimensions are learned per opponent (thousands of combinations),
-each scored 65% vs that opponent / 35% globally, with exploration noise so
-the bots keep experimenting instead of locking into one build:
+each scored from global and opponent-specific evidence. New opponents inherit
+the globally strongest plan; matchup evidence gradually receives up to 90% of
+the weight. Training uses stronger confidence exploration, while ladder mode
+uses only 0.5% deliberate exploration per dimension:
 
 * **opening structure** - composed from parameters, not scripts: production
   count (1/2/3 rax, 1/2/4 gates, pool at 12/16/hatch-first), home vs proxy
@@ -32,25 +34,27 @@ the bots keep experimenting instead of locking into one build:
   and swarm/ranged/air/hive compositions, including specialist and capital units
 
 They also adapt in-game (repelled attacks raise the next attack's size bar,
-unit mix follows the enemy's armored/light/air ratios) and fingerprint
-opponents between games. Every game is logged to `data/games_<bot>.jsonl`.
+unit mix follows the enemy's armored/light/air ratios, and urgent counters can
+override a learned composition) and fingerprint opponents between games.
+Every game is logged to `data/games_<bot>.jsonl`.
 
 Run `py -3 analyze.py` after training for standings, matchup grids,
 per-dimension winrates, and each bot's current best answer per opponent.
 
 ## Self-play training arena
 
-`train.py` runs the three bots against each other for hours, round-robin,
-each match in an isolated subprocess. Every game updates each bot's learning
-files, so they adapt to each other all night: builds that lose get abandoned,
-attack timings get tuned, and scouted threats get pre-countered next game.
+`train.py` runs round-robin self-play plus a configurable share of games against
+the built-in Very Hard AI for opponent diversity. Each match is isolated in a
+subprocess; timed-out process trees and new SC2 children are cleaned up, while
+crash output is retained in `crashes.log`.
 
     py -3 train.py --hours 8        (or double-click train.bat)
     py -3 train.py --games 30       quick session
     py -3 train.py --map AutomatonLE --hours 2
+    py -3 train.py --hours 8 --ai-share 0.35
 
 Matches allow up to three in-game hours (`10800` game seconds). Because games
-run faster than real time, the arena uses a 90-minute real-time safety timeout
+run faster than real time, the arena uses a 60-minute real-time safety timeout
 for a stuck match while the overall `--hours` setting remains wall-clock time.
 
 Requirements: StarCraft II installed, `pip install burnysc2`, and ladder maps

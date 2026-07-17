@@ -87,6 +87,7 @@ class ProtoddBot(BotAI):
     RACE_NAME = "Protoss"
 
     def __init__(self):
+        self.raw_affects_selection = True
         self.strategy = None
         self.attack_mode = False
         self.enemy_rush_detected = False
@@ -107,6 +108,8 @@ class ProtoddBot(BotAI):
         self._splash_threat = False
         self._first_pressure_recorded = False
         self._point_order_cache = {}
+        self._special_last_cast = {}
+        self._reported_errors = set()
         self._stats = {}
         self._retreat_count = 0
         self._cached_enemies = None
@@ -142,6 +145,13 @@ class ProtoddBot(BotAI):
             if self.strategy:
                 if self.strategy.expects("rushed") or self.strategy.expects("worker_rush"):
                     self.enemy_rush_detected = True
+                try:
+                    fp = float(self.strategy.profile.get("first_pressure_ewma", 9999))
+                    samples = int(self.strategy.profile.get("pressure_samples", 0))
+                    if samples >= 3 and fp < 360:
+                        self.enemy_rush_detected = True  # their pressure comes early
+                except Exception:
+                    pass
                 if self.strategy.expects("cloak"):
                     self.cloak_threat = True
                 if self.strategy.expects("air"):
@@ -240,6 +250,11 @@ class ProtoddBot(BotAI):
         if (self.cloak_threat or self._max_air_threat >= 3) and self.active_build != "proxy_gates":
             cfg["want_forge"] = cfg["want_forge"] or self.time > 160
             cfg["observer_cap"] = max(cfg["observer_cap"], 1)
+            if self._max_air_threat >= 6:
+                cfg["want_stargate"] = cfg["want_stargate"] or self.time > 240
+                cfg["stargate_cap"] = max(cfg["stargate_cap"], 2)
+                cfg["want_fleet"] = cfg["want_fleet"] or self.time > 480
+                cfg["gas_target"] = max(cfg["gas_target"], 5)
         # Learned tech focus.
         try:
             tech = self.strategy.tech if self.strategy else "blink_stalker"
@@ -284,8 +299,8 @@ class ProtoddBot(BotAI):
     async def on_step(self, iteration: int):
         try:
             await self._step(iteration)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._report_error("on_step", exc)
 
     async def _step(self, iteration: int):
         if not self.greeted and iteration >= 2:
@@ -298,7 +313,11 @@ class ProtoddBot(BotAI):
         if iteration % 64 == 0 and iteration > 0:
             try:
                 avg_ms = self.step_time[1]
-                if avg_ms > 66 and self.client.game_step < 4:
+                if self.supply_used > 170:
+                    self.client.game_step = 6
+                elif self.supply_used > 110:
+                    self.client.game_step = 4
+                elif avg_ms > 66 and self.client.game_step < 4:
                     self.client.game_step = 4
                 elif avg_ms < 25 and self.client.game_step > 2:
                     self.client.game_step = 2
@@ -323,7 +342,8 @@ class ProtoddBot(BotAI):
         await self._safe(self.manage_upgrades(cfg))
         await self._safe(self.manage_scout())
         await self._safe(self.manage_defense())
-        await self._safe(self.control_army(cfg))
+        if iteration % 2 == 0:
+            await self._safe(self.control_army(cfg))
         if iteration % 16 == 0:
             self._track_stats()
             await self._safe(self.distribute_workers())
@@ -331,8 +351,16 @@ class ProtoddBot(BotAI):
     async def _safe(self, coro):
         try:
             await coro
-        except Exception:
-            pass
+        except Exception as exc:
+            name = getattr(getattr(coro, "cr_code", None), "co_name", "task")
+            self._report_error(name, exc)
+
+    def _report_error(self, context, exc):
+        key = (context, type(exc).__name__, str(exc))
+        if key in self._reported_errors:
+            return
+        self._reported_errors.add(key)
+        print("[%s] %s failed: %s: %s" % (self.NAME, context, type(exc).__name__, exc), flush=True)
 
     async def on_end(self, game_result):
         try:
@@ -534,6 +562,9 @@ class ProtoddBot(BotAI):
         bases = self.townhalls.amount
         if self._proxying or self._base_threats:
             return False
+        # Failed pushes: stop banging heads, take a base and grow instead.
+        if self._retreat_count >= 2 and bases == 1 and t > 240:
+            return True
         gates_arm = getattr(self.strategy, "gates_open", "gate2") if self.strategy else "gate2"
         if bases == 1:
             first = {"gate1": 155, "gate2": 240, "gate4": 390}.get(gates_arm, 240)
@@ -741,6 +772,14 @@ class ProtoddBot(BotAI):
         if army_plan not in {"gateway", "mixed"}:
             gateway_units = [u for u in gateway_units if u in {UnitTypeId.ZEALOT, UnitTypeId.STALKER, UnitTypeId.SENTRY}]
         gateway_units.sort(key=lambda u: self.units(u).amount + self.already_pending(u))
+        stalker_target = max(6, 2 * self._max_air_threat)
+        if (
+            UnitTypeId.STALKER in gateway_units
+            and self._max_air_threat >= 3
+            and self.units(UnitTypeId.STALKER).amount + self.already_pending(UnitTypeId.STALKER) < stalker_target
+        ):
+            gateway_units.remove(UnitTypeId.STALKER)
+            gateway_units.insert(0, UnitTypeId.STALKER)
         warp_abilities = {
             UnitTypeId.ZEALOT: AbilityId.WARPGATETRAIN_ZEALOT,
             UnitTypeId.STALKER: AbilityId.WARPGATETRAIN_STALKER,
@@ -804,6 +843,12 @@ class ProtoddBot(BotAI):
             if self.structures(UnitTypeId.ROBOTICSBAY).ready:
                 choices += [UnitTypeId.COLOSSUS, UnitTypeId.DISRUPTOR]
             choices.sort(key=lambda u: self.units(u).amount + self.already_pending(u))
+            if self._armored_seen_max >= max(4, self._light_seen_max):
+                choices.remove(UnitTypeId.IMMORTAL)
+                choices.insert(0, UnitTypeId.IMMORTAL)
+            elif self._light_seen_max >= 8 and UnitTypeId.COLOSSUS in choices:
+                choices.remove(UnitTypeId.COLOSSUS)
+                choices.insert(0, UnitTypeId.COLOSSUS)
             choice = next((u for u in choices if self.can_afford(u)), None)
             if choice is not None and (army_plan in {"robotics", "mixed"} or choice == UnitTypeId.WARPPRISM):
                 robo.train(choice)
@@ -816,6 +861,17 @@ class ProtoddBot(BotAI):
             if self.structures(UnitTypeId.FLEETBEACON).ready:
                 choices += [UnitTypeId.TEMPEST, UnitTypeId.CARRIER]
             choices.sort(key=lambda u: self.units(u).amount + self.already_pending(u))
+            if self._max_air_threat >= 3:
+                preferred = (
+                    UnitTypeId.TEMPEST
+                    if UnitTypeId.TEMPEST in choices and self._max_air_threat >= 8
+                    else UnitTypeId.PHOENIX
+                )
+                choices.remove(preferred)
+                choices.insert(0, preferred)
+            elif self._armored_seen_max >= max(4, self._light_seen_max):
+                choices.remove(UnitTypeId.VOIDRAY)
+                choices.insert(0, UnitTypeId.VOIDRAY)
             choice = next((u for u in choices if self.can_afford(u)), None)
             if choice is not None and army_plan in {"sky", "mixed"}:
                 stargate.train(choice)
@@ -861,6 +917,11 @@ class ProtoddBot(BotAI):
             (UpgradeId.PROTOSSGROUNDARMORSLEVEL1, False),
             (UpgradeId.PROTOSSGROUNDWEAPONSLEVEL2, True),
             (UpgradeId.PROTOSSGROUNDARMORSLEVEL2, True),
+            (UpgradeId.PROTOSSGROUNDWEAPONSLEVEL3, True),
+            (UpgradeId.PROTOSSGROUNDARMORSLEVEL3, True),
+            (UpgradeId.PROTOSSSHIELDSLEVEL1, False),
+            (UpgradeId.PROTOSSSHIELDSLEVEL2, True),
+            (UpgradeId.PROTOSSSHIELDSLEVEL3, True),
         ]
         for forge in self.structures(UnitTypeId.FORGE).ready.idle:
             for upgrade, needs_tc in ground_upgrades:
@@ -868,6 +929,43 @@ class ProtoddBot(BotAI):
                     continue
                 if self.already_pending_upgrade(upgrade) == 0 and self.can_afford(upgrade):
                     forge.research(upgrade)
+                    break
+
+        if self.structures(UnitTypeId.STARGATE):
+            air_upgrades = [
+                UpgradeId.PROTOSSAIRWEAPONSLEVEL1,
+                UpgradeId.PROTOSSAIRARMORSLEVEL1,
+                UpgradeId.PROTOSSAIRWEAPONSLEVEL2,
+                UpgradeId.PROTOSSAIRARMORSLEVEL2,
+                UpgradeId.PROTOSSAIRWEAPONSLEVEL3,
+                UpgradeId.PROTOSSAIRARMORSLEVEL3,
+            ]
+            for core in self.structures(UnitTypeId.CYBERNETICSCORE).ready.idle:
+                for upgrade in air_upgrades:
+                    if self.already_pending_upgrade(upgrade) == 0 and self.can_afford(upgrade):
+                        core.research(upgrade)
+                        break
+
+        for archive in self.structures(UnitTypeId.TEMPLARARCHIVE).ready.idle:
+            upgrade = UpgradeId.PSISTORMTECH
+            if self.already_pending_upgrade(upgrade) == 0 and self.can_afford(upgrade):
+                archive.research(upgrade)
+
+        for bay in self.structures(UnitTypeId.ROBOTICSBAY).ready.idle:
+            upgrade = UpgradeId.EXTENDEDTHERMALLANCE
+            if self.already_pending_upgrade(upgrade) == 0 and self.can_afford(upgrade):
+                bay.research(upgrade)
+
+        for shrine in self.structures(UnitTypeId.DARKSHRINE).ready.idle:
+            upgrade = UpgradeId.DARKTEMPLARBLINKUPGRADE
+            if self.already_pending_upgrade(upgrade) == 0 and self.can_afford(upgrade):
+                shrine.research(upgrade)
+
+        fleet_upgrades = [UpgradeId.VOIDRAYSPEEDUPGRADE, UpgradeId.TEMPESTGROUNDATTACKUPGRADE]
+        for beacon in self.structures(UnitTypeId.FLEETBEACON).ready.idle:
+            for upgrade in fleet_upgrades:
+                if self.already_pending_upgrade(upgrade) == 0 and self.can_afford(upgrade):
+                    beacon.research(upgrade)
                     break
 
     # ------------------------------------------------------------- scout/def
@@ -1129,6 +1227,8 @@ class ProtoddBot(BotAI):
             ):
                 unit.move(center)
                 continue
+            if self._micro_special(unit, target, center):
+                continue
             if unit.type_id in MELEE_TYPES:
                 self._micro_melee(unit, target)
             else:
@@ -1224,6 +1324,143 @@ class ProtoddBot(BotAI):
         if victim.is_flying:
             return threat.air_range
         return threat.ground_range
+
+    def _can_cast_again(self, unit, ability, cooldown):
+        key = (unit.tag, ability)
+        if self.time - self._special_last_cast.get(key, -999.0) < cooldown:
+            return False
+        self._special_last_cast[key] = self.time
+        return True
+
+    @staticmethod
+    def _cluster_anchor(enemies, radius, minimum):
+        best = None
+        best_count = minimum - 1
+        for enemy in enemies:
+            count = enemies.closer_than(radius, enemy).amount
+            if count > best_count:
+                best = enemy
+                best_count = count
+        return best
+
+    def _micro_special(self, unit, target_point, army_center):
+        """Cast Protoss combat abilities before standard weapon control."""
+        enemies = self._cached_enemies
+
+        if unit.type_id == UnitTypeId.SENTRY:
+            local = enemies.closer_than(9, unit)
+            if (
+                local.amount >= 3
+                and unit.energy >= 75
+                and not unit.has_buff(BuffId.GUARDIANSHIELD)
+                and self._can_cast_again(unit, AbilityId.GUARDIANSHIELD_GUARDIANSHIELD, 12.0)
+            ):
+                unit(AbilityId.GUARDIANSHIELD_GUARDIANSHIELD)
+                return True
+            choke_target = self._cluster_anchor(local.not_flying, 2.0, 5)
+            if (
+                choke_target is not None
+                and unit.energy >= 50
+                and self._can_cast_again(unit, AbilityId.FORCEFIELD_FORCEFIELD, 5.0)
+            ):
+                unit(AbilityId.FORCEFIELD_FORCEFIELD, choke_target.position)
+                return True
+            return False
+
+        if unit.type_id == UnitTypeId.HIGHTEMPLAR:
+            if self._dodge(unit):
+                return True
+            local = enemies.closer_than(10, unit)
+            storm_target = self._cluster_anchor(local, 2.5, 4)
+            if (
+                self.already_pending_upgrade(UpgradeId.PSISTORMTECH) == 1
+                and unit.energy >= 75
+                and storm_target is not None
+                and self._can_cast_again(unit, AbilityId.PSISTORM_PSISTORM, 3.5)
+            ):
+                unit(AbilityId.PSISTORM_PSISTORM, storm_target.position)
+                return True
+            energized = local.filter(lambda e: e.energy >= 50)
+            if (
+                unit.energy >= 50
+                and energized
+                and self._can_cast_again(unit, AbilityId.FEEDBACK_FEEDBACK, 2.0)
+            ):
+                unit(AbilityId.FEEDBACK_FEEDBACK, max(energized, key=lambda e: e.energy))
+                return True
+            if unit.distance_to(army_center) > 6:
+                unit.move(army_center.towards(self.start_location, 2))
+            return True
+
+        if unit.type_id == UnitTypeId.DISRUPTOR:
+            ground = enemies.not_flying.closer_than(13, unit)
+            nova_target = self._cluster_anchor(ground, 2.5, 4)
+            if (
+                nova_target is not None
+                and self._can_cast_again(unit, AbilityId.EFFECT_PURIFICATIONNOVA, 15.0)
+            ):
+                unit(AbilityId.EFFECT_PURIFICATIONNOVA, nova_target.position)
+                return True
+            if unit.distance_to(army_center) > 7:
+                unit.move(army_center.towards(self.start_location, 3))
+            return True
+
+        if unit.type_id == UnitTypeId.VOIDRAY:
+            armored = enemies.closer_than(7, unit).filter(lambda e: e.is_armored)
+            if (
+                armored
+                and not unit.has_buff(BuffId.VOIDRAYSWARMDAMAGEBOOST)
+                and self._can_cast_again(unit, AbilityId.EFFECT_VOIDRAYPRISMATICALIGNMENT, 18.0)
+            ):
+                unit(AbilityId.EFFECT_VOIDRAYPRISMATICALIGNMENT)
+                return True
+            return False
+
+        if unit.type_id == UnitTypeId.PHOENIX:
+            liftable = enemies.not_flying.closer_than(7, unit).filter(
+                lambda e: not e.is_massive and (e.can_attack_air or e.type_id in SPECIAL_TARGETS)
+            )
+            if (
+                unit.energy >= 50
+                and liftable
+                and self._can_cast_again(unit, AbilityId.GRAVITONBEAM_GRAVITONBEAM, 8.0)
+            ):
+                unit(AbilityId.GRAVITONBEAM_GRAVITONBEAM, max(liftable, key=lambda e: e.health + e.shield))
+                return True
+            return False
+
+        if unit.type_id == UnitTypeId.ORACLE:
+            ground = enemies.not_flying.closer_than(5, unit)
+            beam_on = unit.has_buff(BuffId.ORACLEWEAPON)
+            if ground and unit.energy >= 25 and not beam_on and self._can_cast_again(
+                unit, AbilityId.BEHAVIOR_PULSARBEAMON, 3.0
+            ):
+                unit(AbilityId.BEHAVIOR_PULSARBEAMON)
+                return True
+            if (not ground or unit.energy < 5) and beam_on and self._can_cast_again(
+                unit, AbilityId.BEHAVIOR_PULSARBEAMOFF, 3.0
+            ):
+                unit(AbilityId.BEHAVIOR_PULSARBEAMOFF)
+                return True
+            return False
+
+        if unit.type_id == UnitTypeId.MOTHERSHIP:
+            local = enemies.closer_than(12, unit)
+            warp_target = self._cluster_anchor(local, 3.0, 5)
+            if (
+                unit.energy >= 100
+                and warp_target is not None
+                and self._can_cast_again(unit, AbilityId.EFFECT_TIMEWARP, 15.0)
+            ):
+                unit(AbilityId.EFFECT_TIMEWARP, warp_target.position)
+                return True
+            return False
+
+        if unit.type_id == UnitTypeId.WARPPRISM:
+            if unit.distance_to(army_center) > 7:
+                unit.move(army_center)
+            return True
+        return False
 
     def _micro_ranged(self, unit, target_point, prefer_armored=False):
         if self._dodge(unit):

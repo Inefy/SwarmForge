@@ -4,11 +4,12 @@ Generative strategy learning for Battencruiser (v5).
 There are no named builds anymore. The bot composes its own way to play each
 game from independent learned dimensions - opening structure, gas timing,
 aggression size, economic greed, tech focus - giving hundreds of possible
-playstyles explored axis by axis. Arms are scored 65% vs this opponent and
-35% globally, with exploration noise so it never stops inventing.
+playstyles explored axis by axis. New opponents inherit global evidence while
+matchup evidence gains weight with confidence; training explores more than ladder play.
 """
 
 import json
+import math
 import os
 import random
 import tempfile
@@ -26,8 +27,9 @@ DATA_DIR = "data"
 DATA_FILE = os.path.join(DATA_DIR, "strategies_battencruiser.json")
 GAME_LOG = os.path.join(DATA_DIR, "games_battencruiser.jsonl")
 GLOBAL_KEY = "__global__"
-EXPLORATION = 0.10   # noise on scores (tie-breaking / soft exploration)
-EPSILON = 0.12       # chance per dimension to try a fully random arm
+TRAINING_MODE = os.environ.get("SWARMFORGE_TRAINING") == "1"
+EXPLORATION = 0.02 if TRAINING_MODE else 0.003
+EPSILON = 0.05 if TRAINING_MODE else 0.005
 
 
 def _laplace(wl):
@@ -52,6 +54,10 @@ class StrategyManager:
                 trimmed = [a for a in candidates if a != RUSH_UNSAFE[dim]]
                 if trimmed:
                     candidates = trimmed
+            # Keep generated strategies internally coherent. Proxy/rush openings
+            # cannot afford a capital-tech army plan before the game is decided.
+            if dim == "army" and self.choices.get("location") == "proxy":
+                candidates = ["bio"]
             self.choices[dim] = self._choose(dim, candidates)
             setattr(self, dim, self.choices[dim])
         self.aggression_mult = AGGRESSION_MULTS.get(self.choices.get("aggression"), 1.0)
@@ -121,17 +127,43 @@ class StrategyManager:
             pass
 
     def _choose(self, dim, candidates):
-        # Guaranteed exploration: never stop testing alternatives.
-        if random.random() < EPSILON:
-            return random.choice(candidates)
         opp = self.record.get("dims", {}).get(dim, {})
         glob = self.global_record.get("dims", {}).get(dim, {})
 
+        if random.random() < EPSILON:
+            return random.choice(candidates)
+
+        total_evidence = sum(
+            sum(opp.get(name, [0, 0])) + 0.25 * min(40, sum(glob.get(name, [0, 0])))
+            for name in candidates
+        )
+        global_totals = [0, 0]
+        for name in candidates:
+            wl = glob.get(name, [0, 0])
+            global_totals[0] += wl[0]
+            global_totals[1] += wl[1]
+        global_baseline = _laplace(global_totals)
+
         def score(item):
             index, name = item
-            s = 0.65 * _laplace(opp.get(name, [0, 0])) + 0.35 * _laplace(glob.get(name, [0, 0]))
+            opp_wl = opp.get(name, [0, 0])
+            global_wl = glob.get(name, [0, 0])
+            opp_trials = sum(opp_wl)
+            global_trials = sum(global_wl)
+            # New opponents inherit the globally strongest plan. Matchup data
+            # takes over smoothly instead of three lucky games flipping policy.
+            opponent_weight = min(0.9, opp_trials / (opp_trials + 8.0))
+            global_rate = _laplace(global_wl)
+            if not TRAINING_MODE and global_trials == 0:
+                # Exploration belongs in the arena. Do not make a ladder debut
+                # with an entirely unproven arm just because its prior is 50%.
+                global_rate = max(0.0, global_baseline - 0.05)
+            s = opponent_weight * _laplace(opp_wl) + (1.0 - opponent_weight) * global_rate
+            evidence = opp_trials + 0.25 * min(40, global_trials)
+            ucb_scale = 0.08 if TRAINING_MODE else 0.025
+            s += ucb_scale * math.sqrt(math.log(total_evidence + 2.0) / (evidence + 1.0))
             s += random.uniform(0.0, EXPLORATION)
-            s += (len(candidates) - index) * 0.005
+            s += (len(candidates) - index) * 0.002
             return s
 
         _, best = max(enumerate(candidates), key=score)
@@ -157,9 +189,13 @@ class StrategyManager:
             if "max_air" in self.observed:
                 profile["max_air"] = max(int(profile.get("max_air", 0)), int(self.observed["max_air"]))
             if "first_pressure" in self.observed:
-                previous = profile.get("first_pressure")
                 fp = float(self.observed["first_pressure"])
-                profile["first_pressure"] = fp if previous is None else min(float(previous), fp)
+                samples = int(profile.get("pressure_samples", 0))
+                previous = profile.get("first_pressure_ewma")
+                ewma = fp if previous is None or samples == 0 else 0.8 * float(previous) + 0.2 * fp
+                profile["first_pressure_ewma"] = ewma
+                profile["first_pressure"] = ewma  # backwards-compatible field
+                profile["pressure_samples"] = samples + 1
 
             self.record["last_result"] = "win" if won else "loss"
             self.all_data[self.opponent_id] = self.record
