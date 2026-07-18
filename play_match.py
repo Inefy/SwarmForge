@@ -72,12 +72,20 @@ def main():
         opponent = Bot(Race[BOTS[args.bot2]], ai2, name=args.bot2)
         opponent_name = args.bot2
 
-    result = run_game(
-        maps.get(args.map),
-        [Bot(Race[BOTS[args.bot1]], ai1, name=args.bot1), opponent],
-        realtime=False,
-        game_time_limit=args.game_time_limit,
-    )
+    try:
+        result = run_game(
+            maps.get(args.map),
+            [Bot(Race[BOTS[args.bot1]], ai1, name=args.bot1), opponent],
+            realtime=False,
+            game_time_limit=args.game_time_limit,
+        )
+    except Exception:
+        # Known python-sc2 flake: one client died and run_game asserts on the
+        # partial result list. Report an unknown result instead of crashing
+        # the whole match slot (train.py logs it without counting standings).
+        import traceback
+        traceback.print_exc()
+        result = "Unknown"
 
     def norm(r):
         try:

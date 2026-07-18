@@ -47,7 +47,11 @@ class StrategyManager:
         self.observed = {}
 
         self.choices = {}
-        risky = self.expects("worker_rush") or self.expects("rushed")
+        try:
+            very_early_pressure = float(self.profile.get("first_pressure", 9999)) < 150
+        except Exception:
+            very_early_pressure = False
+        risky = self.expects("worker_rush") or very_early_pressure
         for dim, arms in DIMS.items():
             candidates = list(arms)
             if risky and dim in RUSH_UNSAFE and len(candidates) > 1:
