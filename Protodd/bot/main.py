@@ -23,7 +23,14 @@ from sc2.position import Point2
 
 from bot.strategy import StrategyManager
 
-ARMY_TYPES = {UnitTypeId.ZEALOT, UnitTypeId.STALKER, UnitTypeId.IMMORTAL}
+MELEE_TYPES = {UnitTypeId.ZEALOT, UnitTypeId.DARKTEMPLAR, UnitTypeId.ARCHON}
+ARMY_TYPES = MELEE_TYPES | {
+    UnitTypeId.ADEPT, UnitTypeId.STALKER, UnitTypeId.SENTRY,
+    UnitTypeId.HIGHTEMPLAR, UnitTypeId.IMMORTAL, UnitTypeId.COLOSSUS,
+    UnitTypeId.DISRUPTOR, UnitTypeId.WARPPRISM, UnitTypeId.PHOENIX,
+    UnitTypeId.VOIDRAY, UnitTypeId.ORACLE, UnitTypeId.TEMPEST,
+    UnitTypeId.CARRIER, UnitTypeId.MOTHERSHIP,
+}
 WORKER_TYPES = {UnitTypeId.SCV, UnitTypeId.PROBE, UnitTypeId.DRONE, UnitTypeId.MULE}
 IGNORE_TARGETS = {UnitTypeId.LARVA, UnitTypeId.EGG, UnitTypeId.BROODLING, UnitTypeId.INTERCEPTOR}
 SCOUT_IGNORE = {UnitTypeId.OVERLORD, UnitTypeId.OVERSEER, UnitTypeId.OBSERVER}
@@ -80,6 +87,7 @@ class ProtoddBot(BotAI):
     RACE_NAME = "Protoss"
 
     def __init__(self):
+        self.raw_affects_selection = True
         self.strategy = None
         self.attack_mode = False
         self.enemy_rush_detected = False
@@ -100,6 +108,10 @@ class ProtoddBot(BotAI):
         self._splash_threat = False
         self._first_pressure_recorded = False
         self._point_order_cache = {}
+        self._special_last_cast = {}
+        self._reported_errors = set()
+        self._stats = {}
+        self._retreat_count = 0
         self._cached_enemies = None
         self._cached_army_for_spread = None
         self._dodge_zones = []
@@ -133,6 +145,13 @@ class ProtoddBot(BotAI):
             if self.strategy:
                 if self.strategy.expects("rushed") or self.strategy.expects("worker_rush"):
                     self.enemy_rush_detected = True
+                try:
+                    fp = float(self.strategy.profile.get("first_pressure_ewma", 9999))
+                    samples = int(self.strategy.profile.get("pressure_samples", 0))
+                    if samples >= 3 and fp < 360:
+                        self.enemy_rush_detected = True  # their pressure comes early
+                except Exception:
+                    pass
                 if self.strategy.expects("cloak"):
                     self.cloak_threat = True
                 if self.strategy.expects("air"):
@@ -154,60 +173,70 @@ class ProtoddBot(BotAI):
         self.proxy_point = center.towards(enemy_start, center.distance_to(enemy_start) * 0.45)
 
     @property
+    def _proxying(self):
+        return (
+            bool(self.strategy)
+            and getattr(self.strategy, "location", "home") == "proxy"
+            and self.time < 420
+        )
+
+    @property
     def active_build(self):
-        build = self.strategy.build if self.strategy else "four_gate"
-        if build == "proxy_gates" and self.time > 420:
-            return "four_gate"
-        return build
+        # Synthetic label: openings are now composed from learned parameters.
+        return "proxy_gates" if self._proxying else "macro"
 
     @property
     def all_in(self):
-        return self.active_build == "proxy_gates" or self.supply_used > 190 or not self.townhalls
+        return self._proxying or self.supply_used > 190 or not self.townhalls
 
     def _army_supply_est(self):
-        return (
-            2 * self.units(UnitTypeId.ZEALOT).amount
-            + 2 * self.units(UnitTypeId.STALKER).amount
-            + 4 * self.units(UnitTypeId.IMMORTAL).amount
-        )
+        return float(self.supply_army)
 
     def _base_build_config(self):
         t = self.time
-        build = self.active_build
+        s = self.strategy
+        gates0 = {"gate1": 1, "gate2": 2, "gate4": 4}.get(getattr(s, "gates_open", "gate2"), 2)
+        gas0 = {"no_gas": 0, "one_gas": 1, "two_gas": 2}.get(getattr(s, "gas_open", "one_gas"), 1)
         bases = max(1, self.townhalls.amount)
-        if build == "proxy_gates":
+        if self._proxying:
             return dict(
                 probe_cap=17, gas_target=0, gate_cap=0,
                 want_robo=False, want_twilight=False, want_forge=False,
                 immortal_cap=0, observer_cap=0,
                 attack_min=6, retreat_at=0,
+                robo_cap=0, stargate_cap=0, want_robo_bay=False,
+                want_stargate=False, want_fleet=False,
+                want_templar=False, want_dark=False,
             )
-        if build == "four_gate":
-            transitioned = t > 390
-            return dict(
-                probe_cap=(23 if not transitioned else min(66, 22 * bases)),
-                gas_target=(1 if t < 145 else 2),
-                gate_cap=(1 if t < 100 else 4) if not transitioned else 5,
-                want_robo=transitioned, want_twilight=transitioned, want_forge=t > 420,
-                immortal_cap=(2 if transitioned else 0), observer_cap=(1 if transitioned else 0),
-                attack_min=16, retreat_at=6,
-            )
-        # stalker_immortal
-        if bases < 2:
-            gate_cap = 1
-        elif bases == 2:
-            gate_cap = 3
+        developed = bases >= 2 or t > 390
+        if not developed:
+            gate_cap = 1 if t < 100 else gates0
+            probe_cap = 21 + gates0
+            if gates0 >= 4 and t > 140:
+                gas_target = max(gas0, 2)
+            else:
+                gas_target = gas0 if t < 145 else max(gas0, 1)
         else:
-            gate_cap = 6
+            gate_cap = 3 if bases == 2 else 6
+            probe_cap = min(66, 22 * bases)
+            gas_target = min(2 * bases, 6)
+        attack_min = {1: 40, 2: 26, 4: 16}.get(gates0, 26)
         return dict(
-            probe_cap=min(66, 22 * bases),
-            gas_target=(1 if t < 150 else min(2 * bases, 6)),
-            gate_cap=gate_cap,
-            want_robo=(t > 210 and bases >= 2),
-            want_twilight=t > 300,
-            want_forge=t > 320,
-            immortal_cap=4, observer_cap=(2 if self.cloak_threat else 1),
-            attack_min=42, retreat_at=18,
+            probe_cap=probe_cap, gas_target=gas_target, gate_cap=gate_cap,
+            want_robo=(developed and t > 210),
+            want_twilight=(developed and t > 300),
+            want_forge=(developed and t > 320),
+            immortal_cap=(4 if developed else 0),
+            observer_cap=((2 if self.cloak_threat else 1) if developed else 0),
+            attack_min=attack_min,
+            retreat_at=max(4, attack_min * 2 // 5),
+            robo_cap=(1 if developed else 0),
+            stargate_cap=0,
+            want_robo_bay=False,
+            want_stargate=False,
+            want_fleet=False,
+            want_templar=False,
+            want_dark=False,
         )
 
     def build_config(self):
@@ -215,11 +244,54 @@ class ProtoddBot(BotAI):
         try:
             if self.strategy:
                 cfg["attack_min"] = max(2, int(round(cfg["attack_min"] * self.strategy.aggression_mult)))
+                cfg["probe_cap"] = max(12, int(round(cfg["probe_cap"] * self.strategy.greed_worker_mult)))
         except Exception:
             pass
         if (self.cloak_threat or self._max_air_threat >= 3) and self.active_build != "proxy_gates":
             cfg["want_forge"] = cfg["want_forge"] or self.time > 160
             cfg["observer_cap"] = max(cfg["observer_cap"], 1)
+            if self._max_air_threat >= 6:
+                cfg["want_stargate"] = cfg["want_stargate"] or self.time > 240
+                cfg["stargate_cap"] = max(cfg["stargate_cap"], 2)
+                cfg["want_fleet"] = cfg["want_fleet"] or self.time > 480
+                cfg["gas_target"] = max(cfg["gas_target"], 5)
+        # Learned tech focus.
+        try:
+            tech = self.strategy.tech if self.strategy else "blink_stalker"
+            if self.active_build != "proxy_gates":
+                if tech == "immortal_core":
+                    cfg["immortal_cap"] = max(cfg["immortal_cap"], 6)
+                    cfg["want_robo"] = cfg["want_robo"] or self.time > 200
+                elif tech == "chargelot":
+                    cfg["want_twilight"] = cfg["want_twilight"] or self.time > 240
+                army = getattr(self.strategy, "army", "mixed")
+                if army == "gateway":
+                    cfg["gate_cap"] += 2
+                    cfg["want_templar"] = self.time > 420
+                    cfg["want_dark"] = self.time > 520
+                elif army == "robotics":
+                    cfg["robo_cap"] = 3
+                    cfg["want_robo"] = self.time > 180
+                    cfg["want_robo_bay"] = self.time > 360
+                    cfg["immortal_cap"] = 10
+                    cfg["gas_target"] = max(cfg["gas_target"], 5)
+                elif army == "sky":
+                    cfg["stargate_cap"] = 3
+                    cfg["want_stargate"] = self.time > 180
+                    cfg["want_fleet"] = self.time > 450
+                    cfg["gas_target"] = max(cfg["gas_target"], 6)
+                else:
+                    cfg["robo_cap"] = max(2, cfg["robo_cap"])
+                    cfg["stargate_cap"] = 2
+                    cfg["want_robo"] = self.time > 200
+                    cfg["want_stargate"] = self.time > 260
+                    cfg["want_robo_bay"] = self.time > 480
+                    cfg["want_fleet"] = self.time > 600
+                    cfg["want_templar"] = self.time > 500
+                    cfg["want_dark"] = self.time > 650
+                    cfg["gas_target"] = max(cfg["gas_target"], 6)
+        except Exception:
+            pass
         return cfg
 
     # ------------------------------------------------------------------ frame
@@ -227,24 +299,25 @@ class ProtoddBot(BotAI):
     async def on_step(self, iteration: int):
         try:
             await self._step(iteration)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._report_error("on_step", exc)
 
     async def _step(self, iteration: int):
         if not self.greeted and iteration >= 2:
             self.greeted = True
             try:
-                await self.chat_send("(glhf) Protodd online.")
-                if self.strategy:
-                    await self.chat_send("Tag:" + self.strategy.build)
-                    await self.chat_send("Tag:aggr_" + self.strategy.aggression)
+                await self.chat_send("(glhf)")
             except Exception:
                 pass
 
         if iteration % 64 == 0 and iteration > 0:
             try:
                 avg_ms = self.step_time[1]
-                if avg_ms > 66 and self.client.game_step < 4:
+                if self.supply_used > 170:
+                    self.client.game_step = 6
+                elif self.supply_used > 110:
+                    self.client.game_step = 4
+                elif avg_ms > 66 and self.client.game_step < 4:
                     self.client.game_step = 4
                 elif avg_ms < 25 and self.client.game_step > 2:
                     self.client.game_step = 2
@@ -269,20 +342,44 @@ class ProtoddBot(BotAI):
         await self._safe(self.manage_upgrades(cfg))
         await self._safe(self.manage_scout())
         await self._safe(self.manage_defense())
-        await self._safe(self.control_army(cfg))
+        if iteration % 2 == 0:
+            await self._safe(self.control_army(cfg))
         if iteration % 16 == 0:
+            self._track_stats()
             await self._safe(self.distribute_workers())
 
     async def _safe(self, coro):
         try:
             await coro
-        except Exception:
-            pass
+        except Exception as exc:
+            name = getattr(getattr(coro, "cr_code", None), "co_name", "task")
+            self._report_error(name, exc)
+
+    def _report_error(self, context, exc):
+        key = (context, type(exc).__name__, str(exc))
+        if key in self._reported_errors:
+            return
+        self._reported_errors.add(key)
+        print("[%s] %s failed: %s: %s" % (self.NAME, context, type(exc).__name__, exc), flush=True)
 
     async def on_end(self, game_result):
         try:
             if self.strategy:
-                self.strategy.report(game_result == Result.Victory)
+                try:
+                    self._stats["retreats"] = self._retreat_count
+                except Exception:
+                    pass
+                self.strategy.report(game_result == Result.Victory, self._stats)
+        except Exception:
+            pass
+
+    def _track_stats(self):
+        try:
+            s = self._stats
+            s["peak_army_supply"] = max(s.get("peak_army_supply", 0), int(self.supply_army))
+            s["peak_workers"] = max(s.get("peak_workers", 0), int(self.supply_workers))
+            s["max_bases"] = max(s.get("max_bases", 0), self.townhalls.amount)
+            s["end_time"] = round(self.time, 1)
         except Exception:
             pass
 
@@ -329,7 +426,10 @@ class ProtoddBot(BotAI):
         )
 
         if not self.cloak_threat:
-            if enemies.filter(lambda u: u.is_cloaked or u.type_id in CLOAK_UNIT_HINTS):
+            if enemies.filter(
+                lambda u: (u.is_cloaked and u.type_id not in SCOUT_IGNORE)
+                or u.type_id in CLOAK_UNIT_HINTS
+            ):
                 self.cloak_threat = self._cloak_seen_live = True
             elif self.enemy_structures.of_type(CLOAK_STRUCT_HINTS):
                 self.cloak_threat = self._cloak_seen_live = True
@@ -458,17 +558,19 @@ class ProtoddBot(BotAI):
                     return
 
     def _wants_expand(self):
-        t = self.time
-        build = self.active_build
+        t = self.time + (self.strategy.greed_expand_shift if self.strategy else 0)
         bases = self.townhalls.amount
-        if build == "proxy_gates" or self._base_threats:
+        if self._proxying or self._base_threats:
             return False
-        if build == "four_gate":
-            if bases == 1:
-                return t > 390
-            return self.minerals > 500 and t > 520
+        # Failed pushes: stop banging heads, take a base and grow instead.
+        if self._retreat_count >= 2 and bases == 1 and t > 240:
+            return True
+        gates_arm = getattr(self.strategy, "gates_open", "gate2") if self.strategy else "gate2"
         if bases == 1:
-            return t > 155 and not (self.enemy_rush_detected and t < 240)
+            first = {"gate1": 155, "gate2": 240, "gate4": 390}.get(gates_arm, 240)
+            if self.enemy_rush_detected:
+                first = max(first, 240)
+            return t > first
         if bases == 2:
             return t > 390
         return self.minerals > 500 and t > 540
@@ -527,13 +629,38 @@ class ProtoddBot(BotAI):
 
         if cfg["want_robo"] and core_ready:
             robos = self.structures(UnitTypeId.ROBOTICSFACILITY).amount + self.already_pending(UnitTypeId.ROBOTICSFACILITY)
-            if robos == 0 and self.can_afford(UnitTypeId.ROBOTICSFACILITY):
+            if robos < cfg["robo_cap"] and self.can_afford(UnitTypeId.ROBOTICSFACILITY):
                 await self._build_near(UnitTypeId.ROBOTICSFACILITY, anchor, step=3)
 
         if cfg["want_twilight"] and core_ready:
             tc = self.structures(UnitTypeId.TWILIGHTCOUNCIL).amount + self.already_pending(UnitTypeId.TWILIGHTCOUNCIL)
             if tc == 0 and self.can_afford(UnitTypeId.TWILIGHTCOUNCIL):
                 await self._build_near(UnitTypeId.TWILIGHTCOUNCIL, anchor, step=3)
+
+        if cfg["want_stargate"] and core_ready:
+            total = self.structures(UnitTypeId.STARGATE).amount + self.already_pending(UnitTypeId.STARGATE)
+            if total < cfg["stargate_cap"] and self.can_afford(UnitTypeId.STARGATE):
+                await self._build_near(UnitTypeId.STARGATE, anchor, step=3)
+
+        if cfg["want_robo_bay"] and self.structures(UnitTypeId.ROBOTICSFACILITY).ready:
+            total = self.structures(UnitTypeId.ROBOTICSBAY).amount + self.already_pending(UnitTypeId.ROBOTICSBAY)
+            if total == 0 and self.can_afford(UnitTypeId.ROBOTICSBAY):
+                await self._build_near(UnitTypeId.ROBOTICSBAY, anchor, step=3)
+
+        if cfg["want_fleet"] and self.structures(UnitTypeId.STARGATE).ready:
+            total = self.structures(UnitTypeId.FLEETBEACON).amount + self.already_pending(UnitTypeId.FLEETBEACON)
+            if total == 0 and self.can_afford(UnitTypeId.FLEETBEACON):
+                await self._build_near(UnitTypeId.FLEETBEACON, anchor, step=3)
+
+        if cfg["want_templar"] and self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready:
+            total = self.structures(UnitTypeId.TEMPLARARCHIVE).amount + self.already_pending(UnitTypeId.TEMPLARARCHIVE)
+            if total == 0 and self.can_afford(UnitTypeId.TEMPLARARCHIVE):
+                await self._build_near(UnitTypeId.TEMPLARARCHIVE, anchor, step=3)
+
+        if cfg["want_dark"] and self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready:
+            total = self.structures(UnitTypeId.DARKSHRINE).amount + self.already_pending(UnitTypeId.DARKSHRINE)
+            if total == 0 and self.can_afford(UnitTypeId.DARKSHRINE):
+                await self._build_near(UnitTypeId.DARKSHRINE, anchor, step=3)
 
         if cfg["want_forge"]:
             forges = self.structures(UnitTypeId.FORGE).amount + self.already_pending(UnitTypeId.FORGE)
@@ -567,10 +694,13 @@ class ProtoddBot(BotAI):
                         await self._build_near(UnitTypeId.SHIELDBATTERY, self.natural_position.towards(self.game_info.map_center, 3), step=2)
 
     async def manage_proxy(self, cfg):
-        build = self.strategy.build if self.strategy else ""
         t = self.time
-        # four_gate proxy pylon for forward warp-ins.
-        if self.active_build == "four_gate" and 200 < t < 400:
+        # Forward pylon for warp-ins on gate-heavy home openings.
+        if (
+            not self._proxying
+            and getattr(self.strategy, "gates_open", "") == "gate4"
+            and 200 < t < 400
+        ):
             proxy_pylons = self.structures(UnitTypeId.PYLON).filter(
                 lambda p: p.distance_to(self.proxy_point) < 20
             )
@@ -582,7 +712,7 @@ class ProtoddBot(BotAI):
                         worker.build(UnitTypeId.PYLON, location)
             return
 
-        if build != "proxy_gates" or t > 420:
+        if not self._proxying:
             return
         alive = self.workers.tags
         self.proxy_scv_tags = [tag for tag in self.proxy_scv_tags if tag in alive]
@@ -623,22 +753,41 @@ class ProtoddBot(BotAI):
 
     async def manage_warp_and_train(self, cfg):
         wg_done = self.already_pending_upgrade(UpgradeId.WARPGATERESEARCH) == 1
+        army_plan = getattr(self.strategy, "army", "mixed") if self.strategy else "mixed"
 
         # Morph gateways once warpgate tech is done.
         if wg_done:
             for gate in self.structures(UnitTypeId.GATEWAY).ready.idle:
                 gate(AbilityId.MORPH_WARPGATE)
 
-        stalkers = self.units(UnitTypeId.STALKER).amount
-        zealots = self.units(UnitTypeId.ZEALOT).amount
         core_ready = bool(self.structures(UnitTypeId.CYBERNETICSCORE).ready)
 
-        def want_stalker():
-            if not core_ready:
-                return False
-            if self.vespene < 50:
-                return False
-            return stalkers <= 3 * max(1, zealots) or self.active_build != "proxy_gates"
+        gateway_units = [UnitTypeId.ZEALOT]
+        if core_ready:
+            gateway_units += [UnitTypeId.STALKER, UnitTypeId.ADEPT, UnitTypeId.SENTRY]
+        if self.structures(UnitTypeId.TEMPLARARCHIVE).ready:
+            gateway_units.append(UnitTypeId.HIGHTEMPLAR)
+        if self.structures(UnitTypeId.DARKSHRINE).ready:
+            gateway_units.append(UnitTypeId.DARKTEMPLAR)
+        if army_plan not in {"gateway", "mixed"}:
+            gateway_units = [u for u in gateway_units if u in {UnitTypeId.ZEALOT, UnitTypeId.STALKER, UnitTypeId.SENTRY}]
+        gateway_units.sort(key=lambda u: self.units(u).amount + self.already_pending(u))
+        stalker_target = max(6, 2 * self._max_air_threat)
+        if (
+            UnitTypeId.STALKER in gateway_units
+            and self._max_air_threat >= 3
+            and self.units(UnitTypeId.STALKER).amount + self.already_pending(UnitTypeId.STALKER) < stalker_target
+        ):
+            gateway_units.remove(UnitTypeId.STALKER)
+            gateway_units.insert(0, UnitTypeId.STALKER)
+        warp_abilities = {
+            UnitTypeId.ZEALOT: AbilityId.WARPGATETRAIN_ZEALOT,
+            UnitTypeId.STALKER: AbilityId.WARPGATETRAIN_STALKER,
+            UnitTypeId.ADEPT: AbilityId.TRAINWARP_ADEPT,
+            UnitTypeId.SENTRY: AbilityId.WARPGATETRAIN_SENTRY,
+            UnitTypeId.HIGHTEMPLAR: AbilityId.WARPGATETRAIN_HIGHTEMPLAR,
+            UnitTypeId.DARKTEMPLAR: AbilityId.WARPGATETRAIN_DARKTEMPLAR,
+        }
 
         # Warp-ins.
         warpgates = self.structures(UnitTypeId.WARPGATE).ready
@@ -654,16 +803,14 @@ class ProtoddBot(BotAI):
             if warp_anchor is not None:
                 abilities_list = await self.get_available_abilities(list(warpgates))
                 for warpgate, abilities in zip(warpgates, abilities_list):
-                    if AbilityId.WARPGATETRAIN_STALKER not in abilities:
+                    choice = next(
+                        ((u, warp_abilities[u]) for u in gateway_units
+                         if warp_abilities[u] in abilities and self.can_afford(u)),
+                        None,
+                    )
+                    if choice is None:
                         continue
-                    if want_stalker() and self.can_afford(UnitTypeId.STALKER):
-                        unit_type = UnitTypeId.STALKER
-                        warp_ability = AbilityId.WARPGATETRAIN_STALKER
-                    elif self.can_afford(UnitTypeId.ZEALOT):
-                        unit_type = UnitTypeId.ZEALOT
-                        warp_ability = AbilityId.WARPGATETRAIN_ZEALOT
-                    else:
-                        break
+                    unit_type, warp_ability = choice
                     try:
                         pos = warp_anchor.position.to2.random_on_distance(4)
                     except Exception:
@@ -679,27 +826,66 @@ class ProtoddBot(BotAI):
                 break
             if self.supply_left < 2:
                 break
-            if want_stalker() and self.can_afford(UnitTypeId.STALKER):
-                gate.train(UnitTypeId.STALKER)
-            elif self.can_afford(UnitTypeId.ZEALOT):
-                gate.train(UnitTypeId.ZEALOT)
+            choice = next((u for u in gateway_units if self.can_afford(u)), None)
+            if choice is not None:
+                gate.train(choice)
 
-        # Robo production: observers first, then immortals.
+        # Robotics plans explore support, siege and heavy units.
         observers = self.units(UnitTypeId.OBSERVER).amount + self.already_pending(UnitTypeId.OBSERVER)
-        immortals = self.units(UnitTypeId.IMMORTAL).amount + self.already_pending(UnitTypeId.IMMORTAL)
         for robo in self.structures(UnitTypeId.ROBOTICSFACILITY).ready.idle:
             if self.supply_left < 1:
                 break
             if observers < cfg["observer_cap"] and self.can_afford(UnitTypeId.OBSERVER):
                 robo.train(UnitTypeId.OBSERVER)
                 observers += 1
-            elif (
-                immortals < cfg["immortal_cap"]
-                and self.supply_left >= 4
-                and self.can_afford(UnitTypeId.IMMORTAL)
-            ):
-                robo.train(UnitTypeId.IMMORTAL)
-                immortals += 1
+                continue
+            choices = [UnitTypeId.IMMORTAL, UnitTypeId.WARPPRISM]
+            if self.structures(UnitTypeId.ROBOTICSBAY).ready:
+                choices += [UnitTypeId.COLOSSUS, UnitTypeId.DISRUPTOR]
+            choices.sort(key=lambda u: self.units(u).amount + self.already_pending(u))
+            if self._armored_seen_max >= max(4, self._light_seen_max):
+                choices.remove(UnitTypeId.IMMORTAL)
+                choices.insert(0, UnitTypeId.IMMORTAL)
+            elif self._light_seen_max >= 8 and UnitTypeId.COLOSSUS in choices:
+                choices.remove(UnitTypeId.COLOSSUS)
+                choices.insert(0, UnitTypeId.COLOSSUS)
+            choice = next((u for u in choices if self.can_afford(u)), None)
+            if choice is not None and (army_plan in {"robotics", "mixed"} or choice == UnitTypeId.WARPPRISM):
+                robo.train(choice)
+
+        # Stargate plans can progress from harassment through capital ships.
+        for stargate in self.structures(UnitTypeId.STARGATE).ready.idle:
+            if self.supply_left < 2:
+                break
+            choices = [UnitTypeId.PHOENIX, UnitTypeId.ORACLE, UnitTypeId.VOIDRAY]
+            if self.structures(UnitTypeId.FLEETBEACON).ready:
+                choices += [UnitTypeId.TEMPEST, UnitTypeId.CARRIER]
+            choices.sort(key=lambda u: self.units(u).amount + self.already_pending(u))
+            if self._max_air_threat >= 3:
+                preferred = (
+                    UnitTypeId.TEMPEST
+                    if UnitTypeId.TEMPEST in choices and self._max_air_threat >= 8
+                    else UnitTypeId.PHOENIX
+                )
+                choices.remove(preferred)
+                choices.insert(0, preferred)
+            elif self._armored_seen_max >= max(4, self._light_seen_max):
+                choices.remove(UnitTypeId.VOIDRAY)
+                choices.insert(0, UnitTypeId.VOIDRAY)
+            choice = next((u for u in choices if self.can_afford(u)), None)
+            if choice is not None and army_plan in {"sky", "mixed"}:
+                stargate.train(choice)
+
+        if self.structures(UnitTypeId.FLEETBEACON).ready and not self.units(UnitTypeId.MOTHERSHIP):
+            for nexus in self.townhalls(UnitTypeId.NEXUS).ready.idle:
+                if self.can_afford(UnitTypeId.MOTHERSHIP):
+                    nexus.train(UnitTypeId.MOTHERSHIP)
+                    break
+
+        templars = self.units.of_type({UnitTypeId.HIGHTEMPLAR, UnitTypeId.DARKTEMPLAR}).idle
+        if templars.amount >= 2 and self.units(UnitTypeId.ARCHON).amount < 3:
+            for templar in templars.take(2):
+                templar(AbilityId.MORPH_ARCHON)
 
     async def manage_upgrades(self, cfg):
         if self.active_build == "proxy_gates" and self.time < 420:
@@ -712,15 +898,18 @@ class ProtoddBot(BotAI):
             ):
                 core.research(UpgradeId.WARPGATERESEARCH)
 
+        first, second = UpgradeId.BLINKTECH, UpgradeId.CHARGE
+        if self.strategy and self.strategy.tech == "chargelot":
+            first, second = UpgradeId.CHARGE, UpgradeId.BLINKTECH
         for tc in self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready.idle:
-            if self.already_pending_upgrade(UpgradeId.BLINKTECH) == 0 and self.can_afford(UpgradeId.BLINKTECH):
-                tc.research(UpgradeId.BLINKTECH)
+            if self.already_pending_upgrade(first) == 0 and self.can_afford(first):
+                tc.research(first)
             elif (
-                self.already_pending_upgrade(UpgradeId.BLINKTECH) == 1
-                and self.already_pending_upgrade(UpgradeId.CHARGE) == 0
-                and self.can_afford(UpgradeId.CHARGE)
+                self.already_pending_upgrade(first) == 1
+                and self.already_pending_upgrade(second) == 0
+                and self.can_afford(second)
             ):
-                tc.research(UpgradeId.CHARGE)
+                tc.research(second)
 
         twilight_ready = bool(self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready)
         ground_upgrades = [
@@ -728,6 +917,11 @@ class ProtoddBot(BotAI):
             (UpgradeId.PROTOSSGROUNDARMORSLEVEL1, False),
             (UpgradeId.PROTOSSGROUNDWEAPONSLEVEL2, True),
             (UpgradeId.PROTOSSGROUNDARMORSLEVEL2, True),
+            (UpgradeId.PROTOSSGROUNDWEAPONSLEVEL3, True),
+            (UpgradeId.PROTOSSGROUNDARMORSLEVEL3, True),
+            (UpgradeId.PROTOSSSHIELDSLEVEL1, False),
+            (UpgradeId.PROTOSSSHIELDSLEVEL2, True),
+            (UpgradeId.PROTOSSSHIELDSLEVEL3, True),
         ]
         for forge in self.structures(UnitTypeId.FORGE).ready.idle:
             for upgrade, needs_tc in ground_upgrades:
@@ -735,6 +929,43 @@ class ProtoddBot(BotAI):
                     continue
                 if self.already_pending_upgrade(upgrade) == 0 and self.can_afford(upgrade):
                     forge.research(upgrade)
+                    break
+
+        if self.structures(UnitTypeId.STARGATE):
+            air_upgrades = [
+                UpgradeId.PROTOSSAIRWEAPONSLEVEL1,
+                UpgradeId.PROTOSSAIRARMORSLEVEL1,
+                UpgradeId.PROTOSSAIRWEAPONSLEVEL2,
+                UpgradeId.PROTOSSAIRARMORSLEVEL2,
+                UpgradeId.PROTOSSAIRWEAPONSLEVEL3,
+                UpgradeId.PROTOSSAIRARMORSLEVEL3,
+            ]
+            for core in self.structures(UnitTypeId.CYBERNETICSCORE).ready.idle:
+                for upgrade in air_upgrades:
+                    if self.already_pending_upgrade(upgrade) == 0 and self.can_afford(upgrade):
+                        core.research(upgrade)
+                        break
+
+        for archive in self.structures(UnitTypeId.TEMPLARARCHIVE).ready.idle:
+            upgrade = UpgradeId.PSISTORMTECH
+            if self.already_pending_upgrade(upgrade) == 0 and self.can_afford(upgrade):
+                archive.research(upgrade)
+
+        for bay in self.structures(UnitTypeId.ROBOTICSBAY).ready.idle:
+            upgrade = UpgradeId.EXTENDEDTHERMALLANCE
+            if self.already_pending_upgrade(upgrade) == 0 and self.can_afford(upgrade):
+                bay.research(upgrade)
+
+        for shrine in self.structures(UnitTypeId.DARKSHRINE).ready.idle:
+            upgrade = UpgradeId.DARKTEMPLARBLINKUPGRADE
+            if self.already_pending_upgrade(upgrade) == 0 and self.can_afford(upgrade):
+                shrine.research(upgrade)
+
+        fleet_upgrades = [UpgradeId.VOIDRAYSPEEDUPGRADE, UpgradeId.TEMPESTGROUNDATTACKUPGRADE]
+        for beacon in self.structures(UnitTypeId.FLEETBEACON).ready.idle:
+            for upgrade in fleet_upgrades:
+                if self.already_pending_upgrade(upgrade) == 0 and self.can_afford(upgrade):
+                    beacon.research(upgrade)
                     break
 
     # ------------------------------------------------------------- scout/def
@@ -807,11 +1038,19 @@ class ProtoddBot(BotAI):
                     assigned += 1
 
         ths = self.townhalls
-        threats = self.enemy_units.filter(
+        nearby = self.enemy_units.filter(
             lambda u: u.type_id not in SCOUT_IGNORE
             and u.type_id not in IGNORE_TARGETS
             and any(u.distance_to(th) < 25 for th in ths)
         )
+        real_threats = nearby.filter(lambda u: u.type_id not in WORKER_TYPES)
+        worker_intruders = nearby.of_type(WORKER_TYPES)
+        if real_threats:
+            threats = nearby if worker_intruders else real_threats
+        elif worker_intruders.amount >= 3:
+            threats = worker_intruders
+        else:
+            threats = None  # a lone scouting worker is not an invasion
         self._base_threats = threats if threats else None
         if threats and not self._first_pressure_recorded:
             self._first_pressure_recorded = True
@@ -946,11 +1185,12 @@ class ProtoddBot(BotAI):
         else:
             wg_done = self.already_pending_upgrade(UpgradeId.WARPGATERESEARCH) == 1
             gate_ok = wg_done or t > 350
-            if not self.attack_mode and t > self._retreat_until and est >= cfg["attack_min"] and gate_ok:
+            if not self.attack_mode and t > self._retreat_until and gate_ok and est >= cfg["attack_min"] * (1 + 0.15 * min(3, self._retreat_count)):
                 self.attack_mode = True
             if self.attack_mode and est <= cfg["retreat_at"]:
                 self.attack_mode = False
                 self._retreat_until = t + 10
+                self._retreat_count += 1
             if self.supply_used > 190:
                 self.attack_mode = True
 
@@ -963,6 +1203,7 @@ class ProtoddBot(BotAI):
                 if theirs > ours * 1.4:
                     self.attack_mode = False
                     self._retreat_until = t + 12
+                    self._retreat_count += 1
 
         defending = self._base_threats is not None
         if defending:
@@ -986,7 +1227,9 @@ class ProtoddBot(BotAI):
             ):
                 unit.move(center)
                 continue
-            if unit.type_id == UnitTypeId.ZEALOT:
+            if self._micro_special(unit, target, center):
+                continue
+            if unit.type_id in MELEE_TYPES:
                 self._micro_melee(unit, target)
             else:
                 self._micro_ranged(unit, target, prefer_armored=(unit.type_id == UnitTypeId.IMMORTAL))
@@ -1081,6 +1324,143 @@ class ProtoddBot(BotAI):
         if victim.is_flying:
             return threat.air_range
         return threat.ground_range
+
+    def _can_cast_again(self, unit, ability, cooldown):
+        key = (unit.tag, ability)
+        if self.time - self._special_last_cast.get(key, -999.0) < cooldown:
+            return False
+        self._special_last_cast[key] = self.time
+        return True
+
+    @staticmethod
+    def _cluster_anchor(enemies, radius, minimum):
+        best = None
+        best_count = minimum - 1
+        for enemy in enemies:
+            count = enemies.closer_than(radius, enemy).amount
+            if count > best_count:
+                best = enemy
+                best_count = count
+        return best
+
+    def _micro_special(self, unit, target_point, army_center):
+        """Cast Protoss combat abilities before standard weapon control."""
+        enemies = self._cached_enemies
+
+        if unit.type_id == UnitTypeId.SENTRY:
+            local = enemies.closer_than(9, unit)
+            if (
+                local.amount >= 3
+                and unit.energy >= 75
+                and not unit.has_buff(BuffId.GUARDIANSHIELD)
+                and self._can_cast_again(unit, AbilityId.GUARDIANSHIELD_GUARDIANSHIELD, 12.0)
+            ):
+                unit(AbilityId.GUARDIANSHIELD_GUARDIANSHIELD)
+                return True
+            choke_target = self._cluster_anchor(local.not_flying, 2.0, 5)
+            if (
+                choke_target is not None
+                and unit.energy >= 50
+                and self._can_cast_again(unit, AbilityId.FORCEFIELD_FORCEFIELD, 5.0)
+            ):
+                unit(AbilityId.FORCEFIELD_FORCEFIELD, choke_target.position)
+                return True
+            return False
+
+        if unit.type_id == UnitTypeId.HIGHTEMPLAR:
+            if self._dodge(unit):
+                return True
+            local = enemies.closer_than(10, unit)
+            storm_target = self._cluster_anchor(local, 2.5, 4)
+            if (
+                self.already_pending_upgrade(UpgradeId.PSISTORMTECH) == 1
+                and unit.energy >= 75
+                and storm_target is not None
+                and self._can_cast_again(unit, AbilityId.PSISTORM_PSISTORM, 3.5)
+            ):
+                unit(AbilityId.PSISTORM_PSISTORM, storm_target.position)
+                return True
+            energized = local.filter(lambda e: e.energy >= 50)
+            if (
+                unit.energy >= 50
+                and energized
+                and self._can_cast_again(unit, AbilityId.FEEDBACK_FEEDBACK, 2.0)
+            ):
+                unit(AbilityId.FEEDBACK_FEEDBACK, max(energized, key=lambda e: e.energy))
+                return True
+            if unit.distance_to(army_center) > 6:
+                unit.move(army_center.towards(self.start_location, 2))
+            return True
+
+        if unit.type_id == UnitTypeId.DISRUPTOR:
+            ground = enemies.not_flying.closer_than(13, unit)
+            nova_target = self._cluster_anchor(ground, 2.5, 4)
+            if (
+                nova_target is not None
+                and self._can_cast_again(unit, AbilityId.EFFECT_PURIFICATIONNOVA, 15.0)
+            ):
+                unit(AbilityId.EFFECT_PURIFICATIONNOVA, nova_target.position)
+                return True
+            if unit.distance_to(army_center) > 7:
+                unit.move(army_center.towards(self.start_location, 3))
+            return True
+
+        if unit.type_id == UnitTypeId.VOIDRAY:
+            armored = enemies.closer_than(7, unit).filter(lambda e: e.is_armored)
+            if (
+                armored
+                and not unit.has_buff(BuffId.VOIDRAYSWARMDAMAGEBOOST)
+                and self._can_cast_again(unit, AbilityId.EFFECT_VOIDRAYPRISMATICALIGNMENT, 18.0)
+            ):
+                unit(AbilityId.EFFECT_VOIDRAYPRISMATICALIGNMENT)
+                return True
+            return False
+
+        if unit.type_id == UnitTypeId.PHOENIX:
+            liftable = enemies.not_flying.closer_than(7, unit).filter(
+                lambda e: not e.is_massive and (e.can_attack_air or e.type_id in SPECIAL_TARGETS)
+            )
+            if (
+                unit.energy >= 50
+                and liftable
+                and self._can_cast_again(unit, AbilityId.GRAVITONBEAM_GRAVITONBEAM, 8.0)
+            ):
+                unit(AbilityId.GRAVITONBEAM_GRAVITONBEAM, max(liftable, key=lambda e: e.health + e.shield))
+                return True
+            return False
+
+        if unit.type_id == UnitTypeId.ORACLE:
+            ground = enemies.not_flying.closer_than(5, unit)
+            beam_on = unit.has_buff(BuffId.ORACLEWEAPON)
+            if ground and unit.energy >= 25 and not beam_on and self._can_cast_again(
+                unit, AbilityId.BEHAVIOR_PULSARBEAMON, 3.0
+            ):
+                unit(AbilityId.BEHAVIOR_PULSARBEAMON)
+                return True
+            if (not ground or unit.energy < 5) and beam_on and self._can_cast_again(
+                unit, AbilityId.BEHAVIOR_PULSARBEAMOFF, 3.0
+            ):
+                unit(AbilityId.BEHAVIOR_PULSARBEAMOFF)
+                return True
+            return False
+
+        if unit.type_id == UnitTypeId.MOTHERSHIP:
+            local = enemies.closer_than(12, unit)
+            warp_target = self._cluster_anchor(local, 3.0, 5)
+            if (
+                unit.energy >= 100
+                and warp_target is not None
+                and self._can_cast_again(unit, AbilityId.EFFECT_TIMEWARP, 15.0)
+            ):
+                unit(AbilityId.EFFECT_TIMEWARP, warp_target.position)
+                return True
+            return False
+
+        if unit.type_id == UnitTypeId.WARPPRISM:
+            if unit.distance_to(army_center) > 7:
+                unit.move(army_center)
+            return True
+        return False
 
     def _micro_ranged(self, unit, target_point, prefer_armored=False):
         if self._dodge(unit):

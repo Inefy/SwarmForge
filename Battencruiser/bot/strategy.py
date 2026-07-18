@@ -1,45 +1,75 @@
 """
-Per-opponent learning for Battencruiser, persisted between games via ./data.
+Generative strategy learning for Battencruiser (v5).
 
-Three systems:
- 1. Build bandit   - win/loss per build per opponent (Laplace-smoothed winrate).
- 2. Timing bandit  - attack early / on time / late, learned per opponent.
- 3. Opponent profile - fingerprints rushes, worker rushes, cannon rushes, cloak,
-    air comps and earliest pressure so the NEXT game starts pre-adapted.
+There are no named builds anymore. The bot composes its own way to play each
+game from independent learned dimensions - opening structure, gas timing,
+aggression size, economic greed, tech focus - giving hundreds of possible
+playstyles explored axis by axis. New opponents inherit global evidence while
+matchup evidence gains weight with confidence; training explores more than ladder play.
 """
 
 import json
+import math
 import os
+import random
 import tempfile
+import time
 
-BUILDS = ['three_rax', 'bio_macro', 'proxy_2rax']
+DIMS = {'production': ['2rax', '1rax', '3rax'], 'location': ['home', 'proxy'], 'gas_open': ['one_gas', 'no_gas', 'two_gas'], 'aggression': ['standard', 'early', 'very_early', 'late', 'very_late'], 'greed': ['standard', 'greedy', 'lean'], 'tech': ['tank_bio', 'marine_bio', 'marauder_bio'], 'army': ['bio', 'mech', 'sky', 'mixed']}
 
-RACE_PRIORITY = {'Zerg': ['three_rax', 'bio_macro', 'proxy_2rax'], 'Terran': ['bio_macro', 'three_rax', 'proxy_2rax'], 'Protoss': ['bio_macro', 'three_rax', 'proxy_2rax'], 'Random': ['three_rax', 'bio_macro', 'proxy_2rax']}
-
-RUSH_UNSAFE_BUILD = 'proxy_2rax'
-
-AGGRESSION_ARMS = [("standard", 1.0), ("early", 0.7), ("late", 1.4)]
+AGGRESSION_MULTS = {"standard": 1.0, "early": 0.75, "very_early": 0.55, "late": 1.3, "very_late": 1.7}
+GREED_PARAMS = {"standard": (1.0, 0), "greedy": (1.15, 50), "lean": (0.85, -60)}
+RUSH_UNSAFE = {'location': 'proxy'}
+OPENING_MIGRATION = {'three_rax': {'production': '3rax', 'location': 'home'}, 'bio_macro': {'production': '1rax', 'location': 'home'}, 'proxy_2rax': {'production': '2rax', 'location': 'proxy'}}
 PROFILE_FLAGS = ["rushed", "worker_rush", "cannon_rush", "cloak", "air"]
 
 DATA_DIR = "data"
 DATA_FILE = os.path.join(DATA_DIR, "strategies_battencruiser.json")
+GAME_LOG = os.path.join(DATA_DIR, "games_battencruiser.jsonl")
+GLOBAL_KEY = "__global__"
+TRAINING_MODE = os.environ.get("SWARMFORGE_TRAINING") == "1"
+EXPLORATION = 0.02 if TRAINING_MODE else 0.003
+EPSILON = 0.05 if TRAINING_MODE else 0.005
 
 
 def _laplace(wl):
-    wins, losses = wl[0], wl[1]
-    return (wins + 1.0) / (wins + losses + 2.0)
+    return (wl[0] + 1.0) / (wl[0] + wl[1] + 2.0)
 
 
 class StrategyManager:
     def __init__(self, opponent_id, enemy_race_name="Random"):
         self.opponent_id = str(opponent_id) if opponent_id else "unknown"
-        self.priority = RACE_PRIORITY.get(enemy_race_name, RACE_PRIORITY["Random"])
+        self.enemy_race_name = enemy_race_name
         self.all_data = self._load()
-        self.record = self.all_data.get(self.opponent_id, {})
+        self.record = self._migrate(self.all_data.get(self.opponent_id, {}))
+        self.global_record = self._migrate(self.all_data.get(GLOBAL_KEY, {}))
         self.profile = self.record.get("profile", {})
         self.observed = {}
-        self.build = self._choose_build()
-        self.aggression, self.aggression_mult = self._choose_aggression()
+
+        self.choices = {}
+        try:
+            very_early_pressure = float(self.profile.get("first_pressure", 9999)) < 150
+        except Exception:
+            very_early_pressure = False
+        risky = self.expects("worker_rush") or very_early_pressure
+        for dim, arms in DIMS.items():
+            candidates = list(arms)
+            if risky and dim in RUSH_UNSAFE and len(candidates) > 1:
+                trimmed = [a for a in candidates if a != RUSH_UNSAFE[dim]]
+                if trimmed:
+                    candidates = trimmed
+            # Keep generated strategies internally coherent. Proxy/rush openings
+            # cannot afford a capital-tech army plan before the game is decided.
+            if dim == "army" and self.choices.get("location") == "proxy":
+                candidates = ["bio"]
+            self.choices[dim] = self._choose(dim, candidates)
+            setattr(self, dim, self.choices[dim])
+        self.aggression_mult = AGGRESSION_MULTS.get(self.choices.get("aggression"), 1.0)
+        greed = GREED_PARAMS.get(self.choices.get("greed"), (1.0, 0))
+        self.greed_worker_mult, self.greed_expand_shift = greed
+        # Human-readable label for logs.
+        self.build = "/".join(self.choices[d] for d in DIMS)
+        self.opening = self.build
         self.reported = False
 
     @staticmethod
@@ -52,6 +82,28 @@ class StrategyManager:
         except Exception:
             pass
         return {}
+
+    @staticmethod
+    def _migrate(record):
+        """v3 builds/aggr -> v4 dims -> v5 seeded generative dims."""
+        try:
+            dims = record.setdefault("dims", {})
+            if "builds" in record and "opening" not in dims:
+                dims["opening"] = record["builds"]
+            if "aggr" in record and "aggression" not in dims:
+                dims["aggression"] = record["aggr"]
+            record.pop("builds", None)
+            record.pop("aggr", None)
+            old_openings = dims.pop("opening", None)
+            if old_openings:
+                for old_arm, wl in old_openings.items():
+                    for dim, arm in OPENING_MIGRATION.get(old_arm, {}).items():
+                        slot = dims.setdefault(dim, {}).setdefault(arm, [0, 0])
+                        slot[0] += wl[0]
+                        slot[1] += wl[1]
+        except Exception:
+            pass
+        return record
 
     def expects(self, flag, threshold=0.4):
         try:
@@ -78,45 +130,60 @@ class StrategyManager:
         except Exception:
             pass
 
-    def _choose_build(self):
-        builds = self.record.get("builds", {})
-        candidates = list(self.priority)
-        if (
-            RUSH_UNSAFE_BUILD
-            and (self.expects("worker_rush") or self.expects("rushed"))
-            and len(candidates) > 1
-        ):
-            candidates = [c for c in candidates if c != RUSH_UNSAFE_BUILD] or candidates
+    def _choose(self, dim, candidates):
+        opp = self.record.get("dims", {}).get(dim, {})
+        glob = self.global_record.get("dims", {}).get(dim, {})
+
+        if random.random() < EPSILON:
+            return random.choice(candidates)
+
+        total_evidence = sum(
+            sum(opp.get(name, [0, 0])) + 0.25 * min(40, sum(glob.get(name, [0, 0])))
+            for name in candidates
+        )
+        global_totals = [0, 0]
+        for name in candidates:
+            wl = glob.get(name, [0, 0])
+            global_totals[0] += wl[0]
+            global_totals[1] += wl[1]
+        global_baseline = _laplace(global_totals)
 
         def score(item):
             index, name = item
-            return (_laplace(builds.get(name, [0, 0])), -index)
+            opp_wl = opp.get(name, [0, 0])
+            global_wl = glob.get(name, [0, 0])
+            opp_trials = sum(opp_wl)
+            global_trials = sum(global_wl)
+            # New opponents inherit the globally strongest plan. Matchup data
+            # takes over smoothly instead of three lucky games flipping policy.
+            opponent_weight = min(0.9, opp_trials / (opp_trials + 8.0))
+            global_rate = _laplace(global_wl)
+            if not TRAINING_MODE and global_trials == 0:
+                # Exploration belongs in the arena. Do not make a ladder debut
+                # with an entirely unproven arm just because its prior is 50%.
+                global_rate = max(0.0, global_baseline - 0.05)
+            s = opponent_weight * _laplace(opp_wl) + (1.0 - opponent_weight) * global_rate
+            evidence = opp_trials + 0.25 * min(40, global_trials)
+            ucb_scale = 0.08 if TRAINING_MODE else 0.025
+            s += ucb_scale * math.sqrt(math.log(total_evidence + 2.0) / (evidence + 1.0))
+            s += random.uniform(0.0, EXPLORATION)
+            s += (len(candidates) - index) * 0.002
+            return s
 
         _, best = max(enumerate(candidates), key=score)
         return best
 
-    def _choose_aggression(self):
-        record = self.record.get("aggr", {})
-
-        def score(item):
-            index, (name, _mult) = item
-            return (_laplace(record.get(name, [0, 0])), -index)
-
-        _, (name, mult) = max(enumerate(AGGRESSION_ARMS), key=score)
-        return name, mult
-
-    def report(self, won):
+    def report(self, won, stats=None):
         if self.reported:
             return
         self.reported = True
         try:
-            builds = self.record.setdefault("builds", {})
-            wl = builds.setdefault(self.build, [0, 0])
-            wl[0 if won else 1] += 1
-
-            aggr = self.record.setdefault("aggr", {})
-            awl = aggr.setdefault(self.aggression, [0, 0])
-            awl[0 if won else 1] += 1
+            for record in (self.record, self.global_record):
+                dims = record.setdefault("dims", {})
+                for dim, arm in self.choices.items():
+                    wl = dims.setdefault(dim, {}).setdefault(arm, [0, 0])
+                    wl[0 if won else 1] += 1
+                record["games"] = int(record.get("games", 0)) + 1
 
             profile = self.record.setdefault("profile", {})
             profile["games"] = int(profile.get("games", 0)) + 1
@@ -126,15 +193,38 @@ class StrategyManager:
             if "max_air" in self.observed:
                 profile["max_air"] = max(int(profile.get("max_air", 0)), int(self.observed["max_air"]))
             if "first_pressure" in self.observed:
-                previous = profile.get("first_pressure")
                 fp = float(self.observed["first_pressure"])
-                profile["first_pressure"] = fp if previous is None else min(float(previous), fp)
+                samples = int(profile.get("pressure_samples", 0))
+                previous = profile.get("first_pressure_ewma")
+                ewma = fp if previous is None or samples == 0 else 0.8 * float(previous) + 0.2 * fp
+                profile["first_pressure_ewma"] = ewma
+                profile["first_pressure"] = ewma  # backwards-compatible field
+                profile["pressure_samples"] = samples + 1
 
-            self.record["last_build"] = self.build
             self.record["last_result"] = "win" if won else "loss"
-            self.record["games"] = int(self.record.get("games", 0)) + 1
             self.all_data[self.opponent_id] = self.record
+            self.all_data[GLOBAL_KEY] = self.global_record
             self._save()
+            self._log_game(won, stats)
+        except Exception:
+            pass
+
+    def _log_game(self, won, stats):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            entry = {
+                "ts": int(time.time()),
+                "opponent": self.opponent_id,
+                "enemy_race": self.enemy_race_name,
+                "won": bool(won),
+            }
+            entry.update(self.choices)
+            if stats:
+                entry["stats"] = stats
+            if self.observed:
+                entry["observed"] = dict(self.observed)
+            with open(GAME_LOG, "a") as f:
+                f.write(json.dumps(entry) + "\n")
         except Exception:
             pass
 
