@@ -1,0 +1,43 @@
+services:
+  sc2_controller:
+    image: aiarena/arenaclient-sc2:v0.8.0
+    environment:
+      ACSC2_PORT: "8083"
+      ACSC2_PROXY_HOST: proxy_controller
+    volumes:
+      - "${SC2_MAPS_DIR}:/root/StarCraftII/maps:ro"
+      - "./logs/sc2_controller:/logs"
+
+  bot_controller1:
+    image: aiarena/arenaclient-bot:v0.8.0
+    environment:
+      ACBOT_PORT: "8081"
+      ACBOT_PROXY_HOST: proxy_controller
+    volumes:
+      - "./bots:/bots"
+      - "../data:/training-data"
+      - "./logs/bot_controller1:/logs"
+
+  bot_controller2:
+    image: aiarena/arenaclient-bot:v0.8.0
+    environment:
+      ACBOT_PORT: "8082"
+      ACBOT_PROXY_HOST: proxy_controller
+    volumes:
+      - "./bots:/bots"
+      - "../data:/training-data"
+      - "./logs/bot_controller2:/logs"
+
+  proxy_controller:
+    image: aiarena/arenaclient-proxy:v0.8.0
+    environment:
+      ACPROXY_PORT: "8080"
+      ACPROXY_BOT_CONT_1_HOST: bot_controller1
+      ACPROXY_BOT_CONT_2_HOST: bot_controller2
+      ACPROXY_SC2_CONT_HOST: sc2_controller
+    volumes:
+      - "./config.toml:/app/config.toml"
+      - "./matches:/app/matches"
+      - "./results.json:/app/results.json"
+      - "./replays:/replays"
+      - "./logs/proxy_controller:/logs"

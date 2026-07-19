@@ -41,6 +41,51 @@ Every game is logged to `data/games_<bot>.jsonl`.
 Run `py -3 analyze.py` after training for standings, matchup grids,
 per-dimension winrates, and each bot's current best answer per opponent.
 
+## Scouting
+
+Beyond the early worker/overlord poke, the bots now run a scouting-intelligence
+layer (`_scout_intel`) that answers the questions that actually decide games:
+- **Base count** - how many bases the enemy has taken (sticky max).
+- **Proxy hunt** - any production/tech/defensive building seen closer to us than
+  to the enemy main is flagged as a proxy; the worker scout also actively sweeps
+  common proxy pockets (map center and the pocket toward our base) early.
+- **Inference from absence** - if the enemy natural is in view but still has no
+  townhall past expansion time and they're on one base, an all-in is assumed.
+
+Each finding feeds the existing rush-defense and per-opponent profile systems,
+so a scouted proxy or one-base read triggers bunkers/spines/batteries now and
+pre-adapts the next game.
+
+## Ladder meta notes
+
+Analysis of real aiarena opponents shows the ladder is **cheese-dominated**:
+proxies, worker/probe rushes, one-base all-ins, reaper/oracle/muta harass,
+mass widow mines, BC/carrier/tempest rushes. Two consequences baked in:
+- Workers now flee raiders in the mineral line (`manage_worker_safety`) instead
+  of mining into a reaper or oracle.
+- Our globally-learned priors come from sibling self-play, which is far less
+  cheesy than the ladder, so the bots may debut over-greedy. Training against
+  the collected `trainingbots/` opponents recalibrates this - weight those
+  games heavily before uploading.
+
+The top open-source bots use winrate-based per-opponent build selection with
+persistence - the same architecture as our bandit, which validates the approach.
+
+## Robustness & performance
+
+`py -3 selftest.py` loads all three bots against a stubbed SC2 API and verifies
+they import, their learning converges/persists/trims correctly, and the micro
+helpers behave - run it after any edit, before shipping (exits nonzero on any
+regression; no SC2 install needed).
+
+The flight recorder logs per-step compute time; if a bot's steps get slow it
+raises its frame-skip automatically (hard failsafe at 150ms) so it never risks
+an aiarena timeout, and `analyze_replays.py` flags games where steps ran hot.
+
+Exploration is gated by SWARMFORGE_TRAINING=1 (set automatically by train.py):
+bots explore aggressively while training and exploit their best learned play on
+the ladder.
+
 ## Loss diagnosis pipeline
 
 Each bot runs a flight recorder that logs macro telemetry every ~8 game-seconds

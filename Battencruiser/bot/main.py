@@ -49,6 +49,12 @@ ARMY_TYPES = BIO_TYPES | MECH_TYPES | AIR_TYPES
 WORKER_TYPES = {UnitTypeId.SCV, UnitTypeId.PROBE, UnitTypeId.DRONE, UnitTypeId.MULE}
 IGNORE_TARGETS = {UnitTypeId.LARVA, UnitTypeId.EGG, UnitTypeId.BROODLING, UnitTypeId.INTERCEPTOR}
 SCOUT_IGNORE = {UnitTypeId.OVERLORD, UnitTypeId.OVERSEER, UnitTypeId.OBSERVER}
+SCOUT_PROXY_STRUCTS = {
+    UnitTypeId.BARRACKS, UnitTypeId.FACTORY, UnitTypeId.STARPORT,
+    UnitTypeId.GATEWAY, UnitTypeId.WARPGATE, UnitTypeId.ROBOTICSFACILITY,
+    UnitTypeId.FORGE, UnitTypeId.PYLON, UnitTypeId.PHOTONCANNON,
+    UnitTypeId.BUNKER, UnitTypeId.SPAWNINGPOOL,
+}
 ENEMY_TOWNHALLS = {
     UnitTypeId.HATCHERY, UnitTypeId.LAIR, UnitTypeId.HIVE, UnitTypeId.NEXUS,
     UnitTypeId.COMMANDCENTER, UnitTypeId.ORBITALCOMMAND, UnitTypeId.PLANETARYFORTRESS,
@@ -56,6 +62,12 @@ ENEMY_TOWNHALLS = {
 STIM_ABILITY = {
     UnitTypeId.MARINE: AbilityId.EFFECT_STIM_MARINE,
     UnitTypeId.MARAUDER: AbilityId.EFFECT_STIM_MARAUDER,
+}
+HARASSER_TYPES = {
+    UnitTypeId.REAPER, UnitTypeId.HELLION, UnitTypeId.HELLIONTANK,
+    UnitTypeId.ORACLE, UnitTypeId.PHOENIX, UnitTypeId.MUTALISK,
+    UnitTypeId.BANSHEE, UnitTypeId.DARKTEMPLAR, UnitTypeId.VOIDRAY,
+    UnitTypeId.ADEPT,
 }
 DEFENSIVE_STRUCTS = {
     UnitTypeId.PHOTONCANNON, UnitTypeId.BUNKER, UnitTypeId.SPINECRAWLER,
@@ -142,6 +154,10 @@ class BattencruiserBot(BotAI):
         self._light_seen_max = 0
         self._heavy_air_seen = 0
         self._splash_threat = False
+        self._enemy_base_count = 0
+        self._proxy_alert = False
+        self._all_in_suspected = False
+        self._enemy_tech_seen = False
         self._first_pressure_recorded = False
         self._cached_bio_for_spread = None
         self._point_order_cache = {}
@@ -399,6 +415,7 @@ class BattencruiserBot(BotAI):
         await self._safe(self.train_army(cfg))
         await self._safe(self.manage_scout())
         await self._safe(self.manage_defense())
+        await self._safe(self.manage_worker_safety())
         if iteration % 2 == 0:
             await self._safe(self.control_army(cfg))
         await self._safe(self.manage_depot_wall())
@@ -554,6 +571,8 @@ class BattencruiserBot(BotAI):
             }
         ):
             self._splash_threat = True
+
+        self._scout_intel()
 
         # Feed the opponent profile (live observations only, not preseeded flags).
         if self.strategy:
@@ -1111,7 +1130,14 @@ class BattencruiserBot(BotAI):
             return
         if scout.is_idle:
             if self.time < 240:
-                scout.move(self.enemy_natural.towards(self.game_info.map_center, 4))
+                # Early on, sweep a proxy pocket first - the ladder is full of
+                # hidden proxies, and a scout that only checks the enemy main
+                # never sees them.
+                if not self._proxy_alert and self.time < 170:
+                    scout.move(self._next_proxy_spot())
+                    scout.move(self.enemy_natural.towards(self.game_info.map_center, 4), queue=True)
+                else:
+                    scout.move(self.enemy_natural.towards(self.game_info.map_center, 4))
                 scout.move(self.enemy_start_locations[0].towards(self.enemy_natural, 6), queue=True)
             else:
                 self.scout_tag = None
@@ -1119,6 +1145,101 @@ class BattencruiserBot(BotAI):
                     mfs = self.mineral_field.closer_than(10, self.townhalls.first)
                     if mfs:
                         scout.gather(mfs.random)
+
+    async def manage_worker_safety(self):
+        """Run workers away from raiders in the mineral line (reapers, oracles,
+        hellions, mutas, DTs, void rays). The ladder meta is harass-heavy; letting
+        workers mine into a reaper or oracle bleeds the economy that wins games.
+        Only pulls the workers actually in danger, and only when our army/static
+        defense at that base can't already cover it."""
+        harassers = self.enemy_units.filter(lambda u: u.type_id in HARASSER_TYPES)
+        if not harassers:
+            return
+        army = self.units.of_type(ARMY_TYPES)
+        defense = self.structures.of_type(DEFENSIVE_STRUCTS)
+        for th in self.townhalls:
+            near = harassers.filter(lambda h: h.distance_to(th) < 13)
+            if not near:
+                continue
+            guards = army.closer_than(13, th).amount + 2 * defense.closer_than(13, th).amount
+            if guards >= near.amount * 3:
+                continue  # our defenders can handle this raid; keep mining
+            # Bases with no raider nearby are safe havens to mine at instead.
+            safe_bases = self.townhalls.filter(
+                lambda t: harassers.closest_distance_to(t) > 16
+            )
+            for h in near:
+                threatened = self.workers.filter(
+                    lambda w: (w.is_gathering or w.is_returning or w.is_idle)
+                    and w.distance_to(h) < 7
+                )
+                for w in threatened:
+                    if safe_bases:
+                        haven = safe_bases.closest_to(w)
+                        mfs = self.mineral_field.closer_than(10, haven)
+                        if mfs:
+                            w.gather(mfs.closest_to(haven))
+                            continue
+                    # No safe base: step directly away from the raider.
+                    self._flee(w, h.position, 5)
+
+    def _scout_intel(self):
+        """Turn raw vision into answers to the questions that decide games:
+        how many bases does the enemy have, is there a proxy, and does the
+        absence of an expansion imply an all-in? Feeds the same rush/defense
+        and per-opponent profile systems the rest of the bot already uses."""
+        t = self.time
+        enemy_main = self.enemy_start_locations[0]
+
+        # 1) Count enemy bases (sticky max).
+        visible_bases = self.enemy_structures.of_type(ENEMY_TOWNHALLS)
+        if visible_bases.amount > self._enemy_base_count:
+            self._enemy_base_count = visible_bases.amount
+
+        # 2) Proxy hunt: a production/tech/defensive building that is closer to us
+        #    than to the enemy main is a proxy - treat it as incoming aggression.
+        if not self._proxy_alert:
+            for s in self.enemy_structures:
+                if s.type_id not in SCOUT_PROXY_STRUCTS:
+                    continue
+                d_main = s.distance_to(enemy_main)
+                if d_main > 45 and s.distance_to(self.start_location) < d_main:
+                    self._proxy_alert = True
+                    self.enemy_rush_detected = self._rush_seen_live = True
+                    if self.strategy:
+                        self.strategy.observe("rushed")
+                        self.strategy.observe("cannon_rush")
+                    break
+
+        # 3) Reasoning from absence: if we can SEE the enemy natural and there is
+        #    no townhall there past the point they should have expanded, and they
+        #    are still on one base, an all-in is very likely -> prepare to defend.
+        if not self._all_in_suspected and 90 < t < 240:
+            try:
+                nat_visible = self.is_visible(self.enemy_natural)
+            except Exception:
+                nat_visible = False
+            if nat_visible:
+                nat_taken = self.enemy_structures.of_type(ENEMY_TOWNHALLS).closer_than(
+                    9, self.enemy_natural
+                )
+                if not nat_taken and self._enemy_base_count <= 1:
+                    self._all_in_suspected = True
+                    self.enemy_rush_detected = self._rush_seen_live = True
+                    if self.strategy:
+                        self.strategy.observe("rushed")
+
+    def _next_proxy_spot(self):
+        """A place worth checking for a hidden proxy: map center, then the
+        midpoints between center and our base (common proxy pocket)."""
+        center = self.game_info.map_center
+        options = [
+            center,
+            center.towards(self.start_location, 18),
+            self.start_location.towards(center, 30),
+        ]
+        idx = int(self.time / 12) % len(options)
+        return options[idx]
 
     async def manage_defense(self):
         t = self.time

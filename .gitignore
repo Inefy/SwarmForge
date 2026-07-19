@@ -8,3 +8,11 @@ data/
 .venv/
 venv/
 .env
+
+# Generated ladder staging and run artifacts.
+ladder/bots/
+ladder/logs/
+ladder/replays/
+ladder/results.json
+ladder/results-history.jsonl
+ladder/matches

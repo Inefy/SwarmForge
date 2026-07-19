@@ -1,0 +1,21 @@
+{
+  "bots": [
+    {"id": "Battencruiser", "name": "Battencruiser", "race": "T", "type": "python", "kind": "workspace", "source": "../Battencruiser"},
+    {"id": "Zacling", "name": "Zacling", "race": "Z", "type": "python", "kind": "workspace", "source": "../Zacling"},
+    {"id": "Protodd", "name": "Protodd", "race": "P", "type": "python", "kind": "workspace", "source": "../Protodd"},
+    {"id": "Aeolus", "name": "Aeolus", "race": "P", "type": "cpplinux", "kind": "archive", "source": "../trainingbots/Aeolus.zip"},
+    {"id": "AxeFighter", "name": "AxeFighter", "race": "T", "type": "dotnetcore", "kind": "archive", "source": "../trainingbots/AxeFighter.zip"},
+    {"id": "Clicadinha", "name": "Clicadinha", "race": "Z", "type": "python", "kind": "archive", "source": "../trainingbots/Clicadinha.zip"},
+    {"id": "clone", "name": "clone", "race": "T", "type": "python", "kind": "archive", "source": "../trainingbots/clone.zip"},
+    {"id": "CryptBotRevival", "name": "CryptBotRevival", "race": "P", "type": "cpplinux", "kind": "archive", "source": "../trainingbots/CryptBotRevival.zip"},
+    {"id": "Mulebot", "name": "Mulebot", "race": "T", "type": "python", "kind": "archive", "source": "../trainingbots/Mulebot.zip"},
+    {"id": "oberon", "name": "oberon", "race": "T", "type": "cpplinux", "kind": "archive", "source": "../trainingbots/oberon.zip"},
+    {"id": "puck", "name": "puck", "race": "P", "type": "cpplinux", "kind": "archive", "source": "../trainingbots/puck.zip"},
+    {"id": "Thssprtssbt", "name": "Thssprtssbt", "race": "P", "type": "python", "kind": "archive", "source": "../trainingbots/Thssprtssbt.zip"},
+    {"id": "Thssprtssbt_fan", "name": "Thssprtssbt_fan", "race": "P", "type": "python", "kind": "archive", "source": "../trainingbots/Thssprtssbt_fan.zip"},
+    {"id": "what", "name": "what", "race": "Z", "type": "python", "kind": "archive", "source": "../trainingbots/what.zip"},
+    {"id": "who", "name": "who", "race": "R", "type": "python", "kind": "archive", "source": "../trainingbots/who.zip"},
+    {"id": "zig-reapers", "name": "zig-reapers", "race": "T", "type": "cpplinux", "kind": "archive", "source": "../trainingbots/zig-reapers.zip"},
+    {"id": "zigster", "name": "zigster", "race": "T", "type": "cpplinux", "kind": "archive", "source": "../trainingbots/zigster.zip"}
+  ]
+}
