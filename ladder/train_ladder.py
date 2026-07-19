@@ -54,9 +54,10 @@ def write_matches(bots: list[dict], mode: str, include_self_play: bool, maps: li
         if round_number % 2:
             first, second = second, first
         rows.append([
-            index + 1,
+            # local-play-bootstrap expects each bot as id, name, race, type.
+            # The runner uses the bot id as the name as well, yielding nine
+            # CSV fields total once the map is appended.
             first["id"], first["name"], first["race"], first["type"],
-            index + 1,
             second["id"], second["name"], second["race"], second["type"],
             maps[(index + round_number) % len(maps)],
         ])
