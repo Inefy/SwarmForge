@@ -37,12 +37,15 @@ def _laplace(wl):
 
 
 class StrategyManager:
-    def __init__(self, opponent_id, enemy_race_name="Random"):
+    def __init__(self, opponent_id, enemy_race_name="Random", map_name=None):
         self.opponent_id = str(opponent_id) if opponent_id else "unknown"
         self.enemy_race_name = enemy_race_name
+        self.map_name = str(map_name) if map_name else "unknown_map"
+        self.map_key = "map::" + self.map_name
         self.all_data = self._load()
         self.record = self._migrate(self.all_data.get(self.opponent_id, {}))
         self.global_record = self._migrate(self.all_data.get(GLOBAL_KEY, {}))
+        self.map_record = self._migrate(self.all_data.get(self.map_key, {}))
         self.profile = self.record.get("profile", {})
         self.observed = {}
 
@@ -133,6 +136,7 @@ class StrategyManager:
     def _choose(self, dim, candidates):
         opp = self.record.get("dims", {}).get(dim, {})
         glob = self.global_record.get("dims", {}).get(dim, {})
+        mp = self.map_record.get("dims", {}).get(dim, {})
 
         if random.random() < EPSILON:
             return random.choice(candidates)
@@ -159,6 +163,12 @@ class StrategyManager:
             if not TRAINING_MODE and global_trials == 0:
                 global_rate = max(0.0, global_baseline - 0.05)
             s = opponent_weight * _laplace(opp_wl) + (1.0 - opponent_weight) * global_rate
+            # Per-map signal: what has worked on THIS map, growing with evidence.
+            map_wl = mp.get(name, [0, 0])
+            map_trials = sum(map_wl)
+            if map_trials:
+                map_weight = min(0.2, map_trials / (map_trials + 15.0))
+                s = (1.0 - map_weight) * s + map_weight * _laplace(map_wl)
             evidence = opp_trials + 0.25 * min(40, global_trials)
             ucb_scale = 0.08 if TRAINING_MODE else 0.025
             s += ucb_scale * math.sqrt(math.log(total_evidence + 2.0) / (evidence + 1.0))
@@ -174,7 +184,7 @@ class StrategyManager:
             return
         self.reported = True
         try:
-            for record in (self.record, self.global_record):
+            for record in (self.record, self.global_record, self.map_record):
                 dims = record.setdefault("dims", {})
                 for dim, arm in self.choices.items():
                     wl = dims.setdefault(dim, {}).setdefault(arm, [0, 0])
@@ -200,6 +210,7 @@ class StrategyManager:
             self.record["last_result"] = "win" if won else "loss"
             self.all_data[self.opponent_id] = self.record
             self.all_data[GLOBAL_KEY] = self.global_record
+            self.all_data[self.map_key] = self.map_record
             self._save()
             self._log_game(won, stats)
         except Exception:
