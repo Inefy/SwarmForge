@@ -51,6 +51,10 @@ started with `SWARMFORGE_TRAINING=1` and share `data/` through the container's
 `/training-data` mount. An imported bot can persist its own learning only if
 its code writes state into that mounted directory.
 
+Each match has a 15-minute wall-clock timeout (`MAX_REAL_TIME = 900`). A bot
+that hangs during startup or gameplay is recorded as an error and the ladder
+continues to the next pairing instead of blocking the whole training session.
+
 The first Docker run downloads the AI Arena local-play images, so it can take
 some time and several gigabytes of disk space. The Windows SC2 installation is
 used as the map source; it is not executed directly inside WSL.

@@ -5,6 +5,7 @@ RESULTS_FILE = "results.json"
 RUN_TYPE = "local"
 REALTIME = false
 MAX_GAME_TIME = 80640
+MAX_REAL_TIME = 900  # Hard wall-clock limit per match, in seconds.
 BOT_CONT_1_HOST = "127.0.0.1"
 BOT_CONT_1_PORT = 8081
 BOT_CONT_2_HOST = "127.0.0.1"
