@@ -22,6 +22,7 @@ from sc2.ids.upgrade_id import UpgradeId
 from sc2.position import Point2
 
 from bot.strategy import StrategyManager
+from bot.recorder import GameRecorder
 
 MELEE_TYPES = {UnitTypeId.ZEALOT, UnitTypeId.DARKTEMPLAR, UnitTypeId.ARCHON}
 ARMY_TYPES = MELEE_TYPES | {
@@ -112,6 +113,8 @@ class ProtoddBot(BotAI):
         self._reported_errors = set()
         self._stats = {}
         self._retreat_count = 0
+        self._focus_board = {}
+        self._recorder = GameRecorder('Protodd', 'protodd')
         self._cached_enemies = None
         self._cached_army_for_spread = None
         self._dodge_zones = []
@@ -137,7 +140,11 @@ class ProtoddBot(BotAI):
         except Exception:
             race_name = "Random"
         try:
-            self.strategy = StrategyManager(getattr(self, "opponent_id", None), race_name)
+            try:
+                map_name = self.game_info.map_name
+            except Exception:
+                map_name = None
+            self.strategy = StrategyManager(getattr(self, "opponent_id", None), race_name, map_name)
         except Exception:
             self.strategy = None
 
@@ -321,6 +328,9 @@ class ProtoddBot(BotAI):
                     self.client.game_step = 4
                 elif avg_ms < 25 and self.client.game_step > 2:
                     self.client.game_step = 2
+                # Hard failsafe: never let a slow step risk an aiarena timeout.
+                if avg_ms > 150:
+                    self.client.game_step = max(self.client.game_step, 8)
             except Exception:
                 pass
 
@@ -346,6 +356,7 @@ class ProtoddBot(BotAI):
             await self._safe(self.control_army(cfg))
         if iteration % 16 == 0:
             self._track_stats()
+            self._recorder.maybe_snapshot(self)
             await self._safe(self.distribute_workers())
 
     async def _safe(self, coro):
@@ -369,7 +380,12 @@ class ProtoddBot(BotAI):
                     self._stats["retreats"] = self._retreat_count
                 except Exception:
                     pass
-                self.strategy.report(game_result == Result.Victory, self._stats)
+                won = game_result == Result.Victory
+                self.strategy.report(won, self._stats)
+                try:
+                    self._recorder.finish(self, won, getattr(self.strategy, "choices", {}))
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -684,14 +700,14 @@ class ProtoddBot(BotAI):
 
         if self.enemy_rush_detected and t < 420 and core_ready:
             nat_nexus = self.townhalls.filter(lambda x: x.distance_to(self.natural_position) < 8)
-            if nat_nexus:
-                if not self.structures(UnitTypeId.PYLON).ready.closer_than(7, self.natural_position):
-                    if self.can_afford(UnitTypeId.PYLON):
-                        await self._build_near(UnitTypeId.PYLON, self.natural_position.towards(self.game_info.map_center, 4), step=2)
-                else:
-                    batteries = self.structures(UnitTypeId.SHIELDBATTERY).amount + self.already_pending(UnitTypeId.SHIELDBATTERY)
-                    if batteries < 1 and self.can_afford(UnitTypeId.SHIELDBATTERY):
-                        await self._build_near(UnitTypeId.SHIELDBATTERY, self.natural_position.towards(self.game_info.map_center, 3), step=2)
+            anchor_pos = self.natural_position if nat_nexus else self.townhalls.first.position
+            if not self.structures(UnitTypeId.PYLON).ready.closer_than(7, anchor_pos):
+                if self.can_afford(UnitTypeId.PYLON):
+                    await self._build_near(UnitTypeId.PYLON, anchor_pos.towards(self.game_info.map_center, 4), step=2)
+            else:
+                batteries = self.structures(UnitTypeId.SHIELDBATTERY).amount + self.already_pending(UnitTypeId.SHIELDBATTERY)
+                if batteries < 2 and self.can_afford(UnitTypeId.SHIELDBATTERY):
+                    await self._build_near(UnitTypeId.SHIELDBATTERY, anchor_pos.towards(self.game_info.map_center, 3), step=2)
 
     async def manage_proxy(self, cfg):
         t = self.time
@@ -1144,11 +1160,19 @@ class ProtoddBot(BotAI):
         except Exception:
             unit.move(self.staging_point)
 
+    def _defensive_point(self):
+        """Best place to hold on defense: the main ramp choke, else staging."""
+        try:
+            return self.main_base_ramp.top_center
+        except Exception:
+            return self.staging_point
+
     async def control_army(self, cfg):
         army = self.units.of_type(ARMY_TYPES)
         if not army:
             return
         self._cached_enemies = self.enemy_units.filter(lambda u: u.type_id not in IGNORE_TARGETS)
+        self._focus_board = {}
         self._cached_army_for_spread = army if self._splash_threat else None
         self._collect_dodge_zones()
         self._blink_escaped = set()
@@ -1207,11 +1231,23 @@ class ProtoddBot(BotAI):
 
         defending = self._base_threats is not None
         if defending:
-            target = self._base_threats.closest_to(self.start_location).position
+            threat = self._base_threats.closest_to(self.start_location)
+            hold = self._defensive_point()
+            # Hold the ramp choke while the enemy is still outside it; engage once
+            # they commit past it. High ground + a narrow front win these fights.
+            if (
+                self.townhalls.amount == 1
+                and threat.distance_to(self.start_location) > hold.distance_to(self.start_location) + 2
+            ):
+                target = hold
+            else:
+                target = threat.position
         elif self.attack_mode:
             target = self._attack_target()
         elif build == "proxy_gates":
             target = self.proxy_point
+        elif self.enemy_rush_detected and t < 360 and self.townhalls.amount == 1:
+            target = self.start_location.towards(self.game_info.map_center, 6)
         else:
             target = self.staging_point if t > 200 else self.natural_position
 
@@ -1256,7 +1292,35 @@ class ProtoddBot(BotAI):
                 worker.attack(self.enemy_start_locations[0])
                 pulled += 1
 
+    def _concave_offset(self, unit, point):
+        """Fan ranged units laterally during the approach so they form a loose
+        concave instead of a single stacked blob. Deterministic per unit tag,
+        so orders stay stable. No-op unless mid-approach to a nearby enemy."""
+        try:
+            if not getattr(self, "attack_mode", False):
+                return point
+            enemies = self._cached_enemies
+            if not enemies:
+                return point
+            nearest = enemies.closest_to(unit)
+            d = nearest.distance_to(unit)
+            if d < 6 or d > 20:
+                return point
+            import math
+            dx = point.x - unit.position.x
+            dy = point.y - unit.position.y
+            norm = math.hypot(dx, dy) or 1.0
+            px, py = -dy / norm, dx / norm
+            lane = ((unit.tag % 7) - 3) * 1.2
+            cand = Point2((point.x + px * lane, point.y + py * lane))
+            if self.in_pathing_grid(cand):
+                return cand
+            return point
+        except Exception:
+            return point
+
     def _ordered_attack_point(self, unit, point):
+        point = self._concave_offset(unit, point)
         cached = self._point_order_cache.get(unit.tag)
         if (
             cached is not None
@@ -1268,26 +1332,65 @@ class ProtoddBot(BotAI):
         self._point_order_cache[unit.tag] = (point, self.time)
         unit.attack(point)
 
+    def _preserve_hurt(self, unit, enemies):
+        """If low on HP and reloading, retreat from the nearest threat that can
+        reach us so the unit survives to keep shooting. Returns True if handled."""
+        try:
+            if unit.weapon_cooldown == 0 or unit.health_percentage >= 0.35:
+                return False
+            if not enemies:
+                return False
+            def reach(e):
+                return (e.air_range if unit.is_flying else e.ground_range)
+            threats = enemies.filter(
+                lambda e: (e.can_attack_air if unit.is_flying else e.can_attack_ground)
+                and e.distance_to(unit) < reach(e) + 1.5
+            )
+            if not threats:
+                return False
+            self._flee(unit, threats.closest_to(unit).position, 2.5)
+            return True
+        except Exception:
+            return False
+
     def _best_target(self, unit, enemies, by_distance=False, prefer_armored=False):
+        """Kill-secure focus fire: finish low-HP targets, never overkill.
+
+        A per-frame damage board tracks damage our units have already committed
+        this step, so once a target has lethal damage queued the next shooter
+        moves on to a fresh one instead of wasting shots on a corpse.
+        """
         in_range = enemies.filter(lambda e: unit.target_in_range(e))
         if not in_range:
             return None
+        board = self._focus_board
+
+        def eff_hp(e):
+            return (e.health + e.shield) - board.get(e.tag, 0.0)
 
         def priority(e):
             if e.type_id in SPECIAL_TARGETS:
-                group = 0
+                group = 0.0
             elif e.can_attack_ground or e.can_attack_air:
-                group = 1
+                group = 1.0
             elif e.type_id in WORKER_TYPES:
-                group = 2
+                group = 2.0
             else:
-                group = 3
+                group = 3.0
             if prefer_armored and e.is_armored:
                 group -= 0.5
-            metric = e.distance_to(unit) if by_distance else (e.health + e.shield)
-            return (group, metric)
+            ehp = eff_hp(e)
+            overkilled = ehp <= 0            # already lethally committed - avoid
+            metric = e.distance_to(unit) if by_distance else ehp
+            return (overkilled, group, metric)
 
-        return min(in_range, key=priority)
+        target = min(in_range, key=priority)
+        try:
+            dmg = unit.calculate_damage_vs_target(target)[0]
+        except Exception:
+            dmg = max(unit.ground_dps, unit.air_dps) * 0.5
+        board[target.tag] = board.get(target.tag, 0.0) + max(1.0, dmg)
+        return target
 
     def _spread_if_needed(self, unit):
         if self._splash_threat and self._cached_army_for_spread:
@@ -1466,6 +1569,8 @@ class ProtoddBot(BotAI):
         if self._dodge(unit):
             return
         enemies = self._cached_enemies
+        if self._preserve_hurt(unit, enemies):
+            return
         if unit.weapon_cooldown == 0:
             if enemies:
                 best = self._best_target(unit, enemies, prefer_armored=prefer_armored)

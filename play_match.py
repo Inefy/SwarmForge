@@ -45,6 +45,7 @@ def main():
     opponent.add_argument("--computer-race", choices=["Terran", "Zerg", "Protoss", "Random"],
                           help="Play vs the built-in non-cheating Very Hard AI")
     parser.add_argument("--map", required=True)
+    parser.add_argument("--save-replay", default=None, help="Path to write a .SC2Replay for human review")
     parser.add_argument("--game-time-limit", type=int, default=10800,
                         help="Max game duration in in-game seconds (default 3 game-hours)")
     args = parser.parse_args()
@@ -78,6 +79,7 @@ def main():
             [Bot(Race[BOTS[args.bot1]], ai1, name=args.bot1), opponent],
             realtime=False,
             game_time_limit=args.game_time_limit,
+            save_replay_as=args.save_replay,
         )
     except Exception:
         # Known python-sc2 flake: one client died and run_game asserts on the

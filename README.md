@@ -41,6 +41,28 @@ Every game is logged to `data/games_<bot>.jsonl`.
 Run `py -3 analyze.py` after training for standings, matchup grids,
 per-dimension winrates, and each bot's current best answer per opponent.
 
+## Loss diagnosis pipeline
+
+Each bot runs a flight recorder that logs macro telemetry every ~8 game-seconds
+to `data/traces_<bot>.jsonl`. After a session, `py -3 analyze_replays.py` reads
+those traces and reports *why* games were lost - ranked failure modes per bot
+and per opponent (supply block, mineral float, passive army, run over early,
+lost even fights, out-teched by air/cloak), each with a concrete fix.
+`--save-replay` on play_match writes a real .SC2Replay for human review.
+
+## Combat micro
+
+Kill-secure focus fire (a per-frame damage board finishes low-HP targets and
+never overkills), damaged ranged units pull back during their reload to survive,
+and units fan into a loose concave while approaching instead of stacking.
+
+## Map awareness
+
+Bots hold the ramp choke on defense (high ground + a narrow front) while the
+enemy is still outside it, engaging once they commit. Strategy learning also
+keeps a per-map record, so a bot can learn that (say) proxy openings work on a
+particular map even when the per-opponent average disagrees.
+
 ## Self-play training arena
 
 `train.py` runs round-robin self-play plus a configurable share of games against
