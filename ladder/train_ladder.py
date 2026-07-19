@@ -145,8 +145,9 @@ def main() -> int:
     LADDER.mkdir(exist_ok=True)
     (LADDER / "replays").mkdir(exist_ok=True)
     (LADDER / "logs").mkdir(exist_ok=True)
-    if not RESULTS.exists():
-        RESULTS.write_text("{}", encoding="utf-8")
+    # Results are per training session. Reset the generated file so a restart
+    # cannot mix a prior stalled session into the new run's counters.
+    RESULTS.write_text("{}", encoding="utf-8")
 
     started = time.monotonic()
     total_games = 0
