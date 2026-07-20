@@ -100,6 +100,10 @@ def test_strategy(name, race):
 
     tmp = tempfile.mkdtemp()
     cwd = os.getcwd(); os.chdir(tmp); os.makedirs("data", exist_ok=True)
+    # Redirect persistence into the sandbox - never touch real learning data.
+    S.DATA_DIR = os.path.join(tmp, "data")
+    S.DATA_FILE = os.path.join(S.DATA_DIR, "strategies_%s.json" % name.lower())
+    S.GAME_LOG = os.path.join(S.DATA_DIR, "games_%s.jsonl" % name.lower())
     try:
         sm = S.StrategyManager("opp_x", race, "MapZ")
         check(set(sm.choices) == set(S.DIMS), "%s: choices != DIMS" % name)

@@ -522,6 +522,8 @@ class ZaclingBot(BotAI):
             pending = self.already_pending(UnitTypeId.OVERLORD)
             threshold = 2 + min(8, self.townhalls.amount * 3)
             max_pending = 2 if self.supply_cap > 40 else 1
+            if self.supply_left <= 0 and self.minerals >= 200:
+                max_pending = max(max_pending, 2)  # blocked with money banked: double up
             if self.supply_left < threshold and pending < max_pending:
                 if self.can_afford(UnitTypeId.OVERLORD):
                     larvae.random.train(UnitTypeId.OVERLORD)

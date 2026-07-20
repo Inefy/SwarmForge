@@ -23,7 +23,9 @@ RUSH_UNSAFE = {'location': 'proxy'}
 OPENING_MIGRATION = {'four_gate': {'gates_open': 'gate4', 'location': 'home'}, 'stalker_immortal': {'gates_open': 'gate1', 'location': 'home'}, 'proxy_gates': {'gates_open': 'gate2', 'location': 'proxy'}}
 PROFILE_FLAGS = ["rushed", "worker_rush", "cannon_rush", "cloak", "air"]
 
-DATA_DIR = "data"
+# Anchored to the bot folder so learning persists no matter the cwd
+# (locally AND on aiarena, where cwd == the bot root).
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 DATA_FILE = os.path.join(DATA_DIR, "strategies_protodd.json")
 GAME_LOG = os.path.join(DATA_DIR, "games_protodd.jsonl")
 GLOBAL_KEY = "__global__"

@@ -46,6 +46,18 @@ def _make_executable(path: Path) -> None:
         path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
+def _seed_files(destination: Path, files: list[str]) -> None:
+    """Create package-declared writable state files that were omitted from a zip."""
+    destination_resolved = destination.resolve()
+    for relative in files:
+        target = (destination / relative).resolve()
+        if destination_resolved not in target.parents:
+            raise ValueError(f"unsafe seed path: {relative}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            target.write_text("", encoding="utf-8")
+
+
 def prepare(dry_run: bool = False) -> list[dict]:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     bots = manifest["bots"]
@@ -72,6 +84,7 @@ def prepare(dry_run: bool = False) -> list[dict]:
             _copy_workspace(source, destination)
         else:
             raise ValueError(f"unknown bot kind: {bot['kind']}")
+        _seed_files(destination, bot.get("seed_files", []))
         for path in destination.rglob("*"):
             _make_executable(path)
 

@@ -23,7 +23,9 @@ RUSH_UNSAFE = {'location': 'proxy'}
 OPENING_MIGRATION = {'three_rax': {'production': '3rax', 'location': 'home'}, 'bio_macro': {'production': '1rax', 'location': 'home'}, 'proxy_2rax': {'production': '2rax', 'location': 'proxy'}}
 PROFILE_FLAGS = ["rushed", "worker_rush", "cannon_rush", "cloak", "air"]
 
-DATA_DIR = "data"
+# Anchored to the bot folder so learning persists no matter the cwd
+# (locally AND on aiarena, where cwd == the bot root).
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 DATA_FILE = os.path.join(DATA_DIR, "strategies_battencruiser.json")
 GAME_LOG = os.path.join(DATA_DIR, "games_battencruiser.jsonl")
 GLOBAL_KEY = "__global__"

@@ -23,7 +23,9 @@ RUSH_UNSAFE = {'pool_timing': 'hatch_first'}
 OPENING_MIGRATION = {'roach_timing': {'pool_timing': 'pool16'}, 'macro_hydra': {'pool_timing': 'pool16'}, 'twelve_pool': {'pool_timing': 'pool12'}}
 PROFILE_FLAGS = ["rushed", "worker_rush", "cannon_rush", "cloak", "air"]
 
-DATA_DIR = "data"
+# Anchored to the bot folder so learning persists no matter the cwd
+# (locally AND on aiarena, where cwd == the bot root).
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 DATA_FILE = os.path.join(DATA_DIR, "strategies_zacling.json")
 GAME_LOG = os.path.join(DATA_DIR, "games_zacling.jsonl")
 GLOBAL_KEY = "__global__"

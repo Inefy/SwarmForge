@@ -152,16 +152,9 @@ def installed_maps(requested):
 
 
 def sync_learned_data():
-    data_dir = os.path.join(HERE, "data")
-    if not os.path.isdir(data_dir):
-        return
-    for bot in BOTS:
-        src = os.path.join(data_dir, "strategies_%s.json" % bot.lower())
-        if os.path.exists(src):
-            dst_dir = os.path.join(HERE, bot, "data")
-            os.makedirs(dst_dir, exist_ok=True)
-            shutil.copy2(src, os.path.join(dst_dir, os.path.basename(src)))
-            print("Synced learning ->", os.path.join(bot, "data", os.path.basename(src)))
+    """Retired: bots now read/write learning inside their own folders
+    (<Bot>/data/), anchored in code - nothing to sync, nothing to clobber."""
+    print("Learning lives in each bot's data/ folder; no sync needed.")
 
 
 def main():

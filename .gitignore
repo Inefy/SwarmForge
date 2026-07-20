@@ -4,6 +4,7 @@ __pycache__/
 training_log.csv
 data/
 */data/
+data_legacy/
 *.zip
 .venv/
 venv/

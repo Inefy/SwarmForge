@@ -539,6 +539,8 @@ class ProtoddBot(BotAI):
         )
         threshold = min(18, 3 + 2 * max(1, production))
         pending_cap = 2 if (self.minerals > 500 and self.supply_cap > 60) else 1
+        if self.supply_left <= 0 and self.minerals >= 150:
+            pending_cap = max(pending_cap, 2)  # blocked with money banked: double up
         if self.supply_left >= threshold:
             return
         if self.already_pending(UnitTypeId.PYLON) >= pending_cap:
@@ -810,7 +812,7 @@ class ProtoddBot(BotAI):
         stalker_target = max(6, 2 * self._max_air_threat)
         if (
             UnitTypeId.STALKER in gateway_units
-            and self._max_air_threat >= 3
+            and self._max_air_threat >= 1
             and self.units(UnitTypeId.STALKER).amount + self.already_pending(UnitTypeId.STALKER) < stalker_target
         ):
             gateway_units.remove(UnitTypeId.STALKER)

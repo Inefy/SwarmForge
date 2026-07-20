@@ -71,7 +71,9 @@ def print_standings(rows):
 
 def print_dimensions():
     for bot in BOTS:
-        path = os.path.join(HERE, "data", "games_%s.jsonl" % bot.lower())
+        path = os.path.join(HERE, bot, "data", "games_%s.jsonl" % bot.lower())
+        if not os.path.exists(path):
+            path = os.path.join(HERE, "data", "games_%s.jsonl" % bot.lower())
         if not os.path.exists(path):
             continue
         entries = []
@@ -110,7 +112,9 @@ def print_memory():
     print("\n" + "=" * 60)
     print("LEARNED MEMORY (current best arms per opponent)")
     for bot in BOTS:
-        path = os.path.join(HERE, "data", "strategies_%s.json" % bot.lower())
+        path = os.path.join(HERE, bot, "data", "strategies_%s.json" % bot.lower())
+        if not os.path.exists(path):
+            path = os.path.join(HERE, "data", "strategies_%s.json" % bot.lower())
         if not os.path.exists(path):
             continue
         data = json.load(open(path))

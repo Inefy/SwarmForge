@@ -16,6 +16,9 @@ services:
     volumes:
       - "./bots:/bots"
       - "../data:/training-data"
+      - "../Battencruiser/data:/bots/Battencruiser/source/data"
+      - "../Zacling/data:/bots/Zacling/source/data"
+      - "../Protodd/data:/bots/Protodd/source/data"
       - "./logs/bot_controller1:/logs"
 
   bot_controller2:
@@ -26,6 +29,9 @@ services:
     volumes:
       - "./bots:/bots"
       - "../data:/training-data"
+      - "../Battencruiser/data:/bots/Battencruiser/source/data"
+      - "../Zacling/data:/bots/Zacling/source/data"
+      - "../Protodd/data:/bots/Protodd/source/data"
       - "./logs/bot_controller2:/logs"
 
   proxy_controller:

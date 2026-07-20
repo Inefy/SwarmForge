@@ -265,7 +265,7 @@ class BattencruiserBot(BotAI):
         except Exception:
             pass
         # Known cloak/air opponents: detection and anti-air much earlier.
-        if (self.cloak_threat or self._max_air_threat >= 3) and self.active_build != "proxy_2rax":
+        if (self.cloak_threat or self._max_air_threat >= 1) and self.active_build != "proxy_2rax":
             cfg["want_ebay"] = cfg["want_ebay"] or self.time > 150
             cfg["want_turrets"] = True
         # Learned tech focus.
@@ -602,6 +602,8 @@ class BattencruiserBot(BotAI):
         )
         threshold = min(16, 3 + 2 * max(1, production))
         pending_cap = 2 if (self.minerals > 500 and self.supply_cap > 60) else 1
+        if self.supply_left <= 0 and self.minerals >= 150:
+            pending_cap = max(pending_cap, 2)  # blocked with money banked: double up
         if self.supply_left >= threshold:
             return
         if self.already_pending(UnitTypeId.SUPPLYDEPOT) >= pending_cap:

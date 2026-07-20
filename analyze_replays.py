@@ -40,15 +40,23 @@ FIXES = {
 
 
 def load_traces(bot):
-    path = os.path.join(HERE, "data", "traces_%s.jsonl" % bot.lower())
     out = []
-    if not os.path.exists(path):
-        return out
-    for line in open(path):
-        try:
-            out.append(json.loads(line))
-        except Exception:
-            pass
+    candidates = [
+        os.path.join(HERE, bot, "data", "traces_%s.jsonl" % bot.lower()),
+        os.path.join(HERE, "data", "traces_%s.jsonl" % bot.lower()),          # legacy
+        os.path.join(HERE, "data", "data", "traces_%s.jsonl" % bot.lower()),  # legacy nested
+    ]
+    seen = set()
+    for path in candidates:
+        if not os.path.exists(path) or path in seen:
+            continue
+        seen.add(path)
+        for line in open(path):
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+        break  # bot-folder file already contains merged history
     return out
 
 

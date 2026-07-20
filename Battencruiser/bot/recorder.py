@@ -34,7 +34,9 @@ def _step_ms(bot):
 class GameRecorder:
     def __init__(self, bot_name, lower):
         self.bot_name = bot_name
-        self.path = os.path.join("data", "traces_%s.jsonl" % lower)
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self._data_dir = os.path.join(base, "data")
+        self.path = os.path.join(self._data_dir, "traces_%s.jsonl" % lower)
         self.snaps = []
         self._next_t = 0.0
 
@@ -77,7 +79,7 @@ class GameRecorder:
 
     def finish(self, bot, won, picks):
         try:
-            os.makedirs("data", exist_ok=True)
+            os.makedirs(self._data_dir, exist_ok=True)
             entry = {
                 "ts": int(time.time()),
                 "bot": self.bot_name,

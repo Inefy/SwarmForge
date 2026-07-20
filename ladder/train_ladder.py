@@ -8,11 +8,11 @@ import datetime as dt
 import itertools
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
 import time
-import re
 from pathlib import Path
 
 
@@ -30,8 +30,11 @@ MAPS = [
 ]
 
 
-def load_bots() -> list[dict]:
-    return json.loads(MANIFEST.read_text(encoding="utf-8"))["bots"]
+def load_bots(include_disabled: bool = False) -> list[dict]:
+    bots = json.loads(MANIFEST.read_text(encoding="utf-8"))["bots"]
+    if include_disabled:
+        return bots
+    return [bot for bot in bots if bot.get("enabled", True)]
 
 
 def pairings(bots: list[dict], mode: str, include_self_play: bool) -> list[tuple[dict, dict]]:
@@ -85,26 +88,146 @@ def _wsl_path(path: Path, distro: str) -> str:
     return result.stdout.strip()
 
 
-def run_compose(distro: str, maps_dir: str) -> int:
+def _compose_command(distro: str, maps_dir: str, action: str) -> list[str]:
     ladder_wsl = _wsl_path(LADDER, distro)
     command = (
         f"cd {shlex.quote(ladder_wsl)} && "
         f"export SC2_MAPS_DIR={shlex.quote(maps_dir)} && "
-        "docker compose -f docker-compose.yml up "
-        "--abort-on-container-exit --exit-code-from proxy_controller"
+        f"docker compose -f docker-compose.yml {action}"
     )
+    return ["wsl", "-d", distro, "--", "bash", "-lc", command]
+
+
+def _stop_process(process: subprocess.Popen) -> None:
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def _compose_down(distro: str, maps_dir: str) -> None:
+    subprocess.run(
+        _compose_command(distro, maps_dir, "down --remove-orphans"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def _progress_marker() -> tuple[int, int, int, int]:
+    def marker(path: Path) -> tuple[int, int]:
+        try:
+            info = path.stat()
+            return info.st_mtime_ns, info.st_size
+        except FileNotFoundError:
+            return 0, 0
+
+    return marker(MATCHES) + marker(RESULTS)
+
+
+def _load_result_document() -> dict:
+    try:
+        document = json.loads(RESULTS.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        document = {}
+    if not isinstance(document, dict):
+        document = {}
+    if not isinstance(document.get("results"), list):
+        document["results"] = []
+    return document
+
+
+def _skip_stalled_match() -> str | None:
+    """Comment out the next match and append a synthetic watchdog result."""
+    lines = MATCHES.read_text(encoding="utf-8").splitlines()
+    for index, line in enumerate(lines):
+        if not line or line.startswith("#"):
+            continue
+        row = next(csv.reader([line]))
+        lines[index] = "#" + line
+        MATCHES.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        document = _load_result_document()
+        document["results"].append({
+            "match": len(document["results"]) + 1,
+            "bot1_name": row[1],
+            "bot2_name": row[5],
+            "type": "WatchdogTimeout",
+            "game_steps": 0,
+        })
+        RESULTS.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+        return f"{row[1]} vs {row[5]}"
+    return None
+
+
+def result_count() -> int:
+    return len(_load_result_document()["results"])
+
+
+def run_compose(
+    distro: str,
+    maps_dir: str,
+    stall_timeout: float,
+    deadline: float | None,
+) -> tuple[int, bool, int]:
+    ladder_wsl = _wsl_path(LADDER, distro)
     print(f"running Docker ladder in WSL distro {distro}: {ladder_wsl}")
-    completed = subprocess.run(["wsl", "-d", distro, "--", "bash", "-lc", command])
-    return completed.returncode
+    watchdog_skips = 0
+    while True:
+        process = subprocess.Popen(_compose_command(
+            distro,
+            maps_dir,
+            "up --abort-on-container-exit --exit-code-from proxy_controller",
+        ))
+        last_marker = _progress_marker()
+        last_progress = time.monotonic()
+        restart = False
+        while process.poll() is None:
+            now = time.monotonic()
+            marker = _progress_marker()
+            if marker != last_marker:
+                last_marker = marker
+                last_progress = now
+            if deadline is not None and now >= deadline:
+                print("session deadline reached; stopping the active match")
+                _stop_process(process)
+                _compose_down(distro, maps_dir)
+                return 0, True, watchdog_skips
+            if now - last_progress >= stall_timeout:
+                print(f"no ladder progress for {stall_timeout:.0f}s; restarting controllers")
+                _stop_process(process)
+                _compose_down(distro, maps_dir)
+                skipped = _skip_stalled_match()
+                if skipped is None:
+                    return 124, False, watchdog_skips
+                watchdog_skips += 1
+                print(f"watchdog skipped stalled match: {skipped}")
+                restart = True
+                break
+            time.sleep(5)
+        if restart:
+            continue
+        return process.returncode or 0, False, watchdog_skips
 
 
-def append_result_history(round_number: int, count: int, exit_code: int) -> None:
+def append_result_history(
+    round_number: int,
+    scheduled: int,
+    completed: int,
+    exit_code: int,
+    watchdog_skips: int,
+    deadline_reached: bool,
+) -> None:
     history = LADDER / "results-history.jsonl"
     record = {
         "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "round": round_number,
-        "matches": count,
+        "scheduled": scheduled,
+        "completed": completed,
         "exit_code": exit_code,
+        "watchdog_skips": watchdog_skips,
+        "deadline_reached": deadline_reached,
     }
     with history.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record) + "\n")
@@ -121,6 +244,9 @@ def main() -> int:
     parser.add_argument("--map", dest="map_name", action="append", help="map stem; repeat to provide a map pool")
     parser.add_argument("--distro", default="Ubuntu", help="WSL distro containing Docker")
     parser.add_argument("--sc2-maps", default="/mnt/e/games/StarCraft II/Maps", help="WSL path mounted into the SC2 container")
+    parser.add_argument("--stall-timeout", type=float, default=1200, help="restart and skip a match after this many seconds without a result")
+    parser.add_argument("--include-disabled", action="store_true", help="include quarantined incompatible bot packages")
+    parser.add_argument("--bot", action="append", dest="bot_ids", help="limit the ladder to named bot ids; repeat for multiple bots")
     parser.add_argument("--no-prepare", action="store_true", help="reuse the already staged ladder/bots directory")
     parser.add_argument("--dry-run", action="store_true", help="write no matches and only print the schedule")
     args = parser.parse_args()
@@ -131,10 +257,24 @@ def main() -> int:
         parser.error("--rounds must be positive and --hours must be greater than zero")
     if args.games is not None and args.games < 1:
         parser.error("--games must be positive")
+    if args.stall_timeout < 60:
+        parser.error("--stall-timeout must be at least 60 seconds")
 
-    bots = load_bots()
+    all_bots = load_bots(include_disabled=True)
+    if args.bot_ids:
+        requested = set(args.bot_ids)
+        known = {bot["id"] for bot in all_bots}
+        unknown = requested - known
+        if unknown:
+            parser.error("unknown bot ids: " + ", ".join(sorted(unknown)))
+        bots = [bot for bot in all_bots if bot["id"] in requested]
+    else:
+        bots = all_bots if args.include_disabled else [bot for bot in all_bots if bot.get("enabled", True)]
+    disabled = [bot for bot in all_bots if not bot.get("enabled", True)]
     planned = pairings(bots, mode, args.include_self_play)
     print(f"{len(bots)} bots, {len(planned)} pairings per round, mode={mode}")
+    if disabled and not args.include_disabled and not args.bot_ids:
+        print("quarantined bots: " + ", ".join(bot["id"] for bot in disabled))
     if args.dry_run:
         for first, second in planned:
             print(f"  {first['id']} ({first['race']}) vs {second['id']} ({second['race']})")
@@ -150,11 +290,12 @@ def main() -> int:
     RESULTS.write_text("{}", encoding="utf-8")
 
     started = time.monotonic()
+    deadline = started + args.hours * 3600 if args.hours is not None else None
     total_games = 0
     round_number = 0
     round_limit = args.rounds if args.rounds is not None else (10**9 if args.hours is not None else 1)
     while round_number < round_limit:
-        if args.hours is not None and time.monotonic() - started >= args.hours * 3600:
+        if deadline is not None and time.monotonic() >= deadline:
             break
         remaining = None if args.games is None else args.games - total_games
         if remaining is not None and remaining <= 0:
@@ -163,14 +304,23 @@ def main() -> int:
         count = write_matches(bots, mode, args.include_self_play, maps, round_number, remaining)
         if count == 0:
             break
-        total_games += count
-        exit_code = run_compose(args.distro, args.sc2_maps)
-        append_result_history(round_number, count, exit_code)
+        before_count = result_count()
+        exit_code, deadline_reached, watchdog_skips = run_compose(
+            args.distro, args.sc2_maps, args.stall_timeout, deadline,
+        )
+        after_count = result_count()
+        completed = after_count - before_count if after_count >= before_count else after_count
+        total_games += completed
+        append_result_history(
+            round_number, count, completed, exit_code, watchdog_skips, deadline_reached,
+        )
         if exit_code != 0:
             return exit_code
+        if deadline_reached:
+            break
         if args.games is not None and total_games >= args.games:
             break
-    print(f"completed {total_games} scheduled games across {round_number} round(s)")
+    print(f"processed {total_games} games across {round_number} round(s)")
     return 0
 
 
